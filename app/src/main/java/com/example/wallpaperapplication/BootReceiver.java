@@ -11,17 +11,33 @@ public class BootReceiver extends BroadcastReceiver {
 
     @Override
     public void onReceive(Context context, Intent intent) {
-        if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction()) ||
-            "android.intent.action.QUICKBOOT_POWERON".equals(intent.getAction())) {
-            
-            Log.d(TAG, "Boot completed, starting StreamingService...");
-            
-            Intent serviceIntent = new Intent(context, StreamingService.class);
+        String action = intent.getAction();
+        if (action == null) return;
+
+        switch (action) {
+            case Intent.ACTION_BOOT_COMPLETED:
+            case "android.intent.action.LOCKED_BOOT_COMPLETED":
+            case "android.intent.action.QUICKBOOT_POWERON":
+            case "android.intent.action.MY_PACKAGE_REPLACED":
+                Log.d(TAG, "Auto-start trigger: " + action);
+                startService(context);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private static void startService(Context context) {
+        try {
+            Intent svc = new Intent(context, StreamingService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent);
+                context.startForegroundService(svc);
             } else {
-                context.startService(serviceIntent);
+                context.startService(svc);
             }
+            Log.d("BootReceiver", "StreamingService started via BootReceiver");
+        } catch (Exception e) {
+            Log.e("BootReceiver", "Failed to start StreamingService", e);
         }
     }
 }
