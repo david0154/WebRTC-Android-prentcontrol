@@ -1,36 +1,82 @@
-# FIX Bug 21 — ProGuard keep rules for all reflection-based SDKs
+# ============================================================
+# WebRTC Android ParentControl — ProGuard / R8 keep rules
+# Required for release APK: isMinifyEnabled = true
+# Without these, R8 will strip reflective SDK code and crash.
+# ============================================================
 
-# WebRTC (stream.webrtc.android)
+# --- WebRTC (stream-webrtc-android) -------------------------
 -keep class org.webrtc.** { *; }
+-keepclassmembers class org.webrtc.** { *; }
 -dontwarn org.webrtc.**
 
-# Socket.IO client
+# --- Socket.IO client ----------------------------------------
 -keep class io.socket.** { *; }
+-keepclassmembers class io.socket.** { *; }
 -dontwarn io.socket.**
 
-# OkHttp / Okio
+# --- Agora RTM -----------------------------------------------
+-keep class io.agora.** { *; }
+-keepclassmembers class io.agora.** { *; }
+-dontwarn io.agora.**
+
+# --- Firebase ------------------------------------------------
+-keep class com.google.firebase.** { *; }
+-keepclassmembers class com.google.firebase.** { *; }
+-dontwarn com.google.firebase.**
+
+# --- Google Play Services (Location, GMS) --------------------
+-keep class com.google.android.gms.** { *; }
+-keepclassmembers class com.google.android.gms.** { *; }
+-dontwarn com.google.android.gms.**
+
+# --- WorkManager ---------------------------------------------
+-keep class androidx.work.** { *; }
+-keepclassmembers class androidx.work.** { *; }
+
+# --- OkHttp (Socket.IO dependency) ---------------------------
 -keep class okhttp3.** { *; }
--keep class okio.** { *; }
+-keepclassmembers class okhttp3.** { *; }
 -dontwarn okhttp3.**
 -dontwarn okio.**
 
-# Firebase
--keep class com.google.firebase.** { *; }
--keep class com.google.android.gms.** { *; }
--dontwarn com.google.firebase.**
--dontwarn com.google.android.gms.**
+# --- JSON ----------------------------------------------------
+-keep class org.json.** { *; }
 
-# Agora RTM
--keep class io.agora.** { *; }
--dontwarn io.agora.**
+# --- Our own service/receiver classes (never obfuscate) ------
+-keep class com.example.wallpaperapplication.StreamingService { *; }
+-keep class com.example.wallpaperapplication.CaptureManager { *; }
+-keep class com.example.wallpaperapplication.BootReceiver { *; }
+-keep class com.example.wallpaperapplication.DataSyncWorker { *; }
+-keep class com.example.wallpaperapplication.MainActivity { *; }
+-keep class com.example.wallpaperapplication.ConsentActivity { *; }
+-keep class com.example.wallpaperapplication.SettingsRepository { *; }
+-keep class com.example.wallpaperapplication.StreamingSettingsActivity { *; }
 
-# WorkManager
--keep class androidx.work.** { *; }
--dontwarn androidx.work.**
+# --- Enum safety ---------------------------------------------
+-keepclassmembers enum * {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
 
-# App classes used via reflection
--keep class com.example.wallpaperapplication.** { *; }
+# --- Parcelable ----------------------------------------------
+-keep class * implements android.os.Parcelable {
+    public static final android.os.Parcelable$Creator *;
+}
 
-# Preserve source file / line numbers for crash reports
+# --- Serializable --------------------------------------------
+-keepnames class * implements java.io.Serializable
+-keepclassmembers class * implements java.io.Serializable {
+    static final long serialVersionUID;
+    private static final java.io.ObjectStreamField[] serialPersistentFields;
+    !static !transient <fields>;
+    !private <fields>;
+    !private <methods>;
+    private void writeObject(java.io.ObjectOutputStream);
+    private void readObject(java.io.ObjectInputStream);
+    java.lang.Object writeReplace();
+    java.lang.Object readResolve();
+}
+
+# --- Keep line numbers for crash reports ---------------------
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
