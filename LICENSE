@@ -1,21 +1,47 @@
-MIT License
+MIT License — Educational Use Only
 
-Copyright (c) 2025 Dhruv Athaide
+Copyright (c) 2026 David
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software was developed by David solely for educational and research
+purposes — to demonstrate WebRTC peer-to-peer streaming, Socket.IO
+signaling, Agora RTM fallback, Firebase presence, and Android background
+service architecture.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to use, study, and modify the Software strictly for personal learning,
+academic research, and non-commercial educational purposes, subject to the
+following conditions:
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. EDUCATIONAL USE ONLY
+   This Software may only be used for lawful educational and research
+   purposes. It must NOT be used, deployed, or distributed for any
+   commercial, surveillance, monitoring, tracking, or other purpose that
+   violates the privacy, consent, or legal rights of any individual.
+
+2. CONSENT REQUIRED
+   Any use of this Software on a device must have the full, informed, and
+   explicit consent of the device owner. Deploying this Software on any
+   device without the owner's knowledge or consent is strictly prohibited
+   and may be illegal under applicable law.
+
+3. NO MALICIOUS USE
+   This Software must not be used to conduct spying, unauthorised
+   surveillance, data harvesting, or any activity that is harmful,
+   deceptive, or unlawful.
+
+4. ATTRIBUTION
+   The above copyright notice, this permission notice, and the educational
+   use restriction must be included in all copies or substantial portions
+   of the Software.
+
+5. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+   FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+By using this Software you agree to these terms.
