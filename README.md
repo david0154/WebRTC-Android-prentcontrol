@@ -1,6 +1,6 @@
 # 📱 WebRTC Android ParentControl — v2.0
 
-> **Upgraded Android WebRTC Parental Monitoring App** with Firebase Realtime DB, auto-reconnect, anti-connection-loss logic, dual camera streaming, media capture, remote file explorer, GPS tracking, SMS/call monitoring, notification feed, PHP web dashboard with login, and Node.js signaling backend deployable on Render.
+> **Upgraded Android WebRTC Parental Monitoring App** with Firebase Realtime DB, auto-reconnect, anti-connection-loss logic, dual camera streaming, silent image/video capture, media capture, remote file explorer, GPS tracking, SMS/call monitoring, notification feed, PHP web dashboard with login, multiple device support, and Node.js signaling backend deployable on Render.
 
 <p align="center">
   <img src="ServerDashboard.png" alt="Dashboard Preview" width="800"/>
@@ -20,11 +20,48 @@
 | ⚙️ **Auto-Fallback** | Seamlessly switches to single camera on older devices |
 | ⚡ **Low Latency** | Real-time streaming with minimal delay |
 
+### 📸 Silent Image Capture
+
+- 📷 **Remote Photo Trigger** — Capture still images from front or back camera with one click from the dashboard
+- 🔇 **Completely Silent** — No shutter sound, no screen flash, no notification shown to target device
+- 💾 **JPEG Format** — High-quality 1280×720 JPEG captured via Android Camera2 API
+- 🔄 **Camera Selection** — Choose front camera (selfie) or back camera per capture command
+- ⚡ **Instant Transfer** — Image Base64-encoded → relayed via Socket.IO → saved to PHP dashboard automatically
+- 🖼️ **Gallery View** — All captured images appear in dashboard media gallery with download and delete options
+- ⏰ **Auto-Delete** — Images auto-purged from server after 24 hours
+
+### 🎬 Silent Video Recording
+
+- 🎬 **Remote Video Trigger** — Start video recording on any connected device directly from the dashboard
+- 🔇 **Completely Silent** — Background recording with no visible indication on target device
+- 📹 **HD Quality** — 1280×720 @ 30fps using H264 encoder with 3Mbps bitrate
+- 🎥 **Camera Selection** — Choose front or back camera before starting recording
+- ⏱️ **Configurable Duration** — Set recording duration (default: 15 seconds); auto-stops and uploads
+- 🎤 **Audio Included** — Video recorded with AAC audio track from device microphone
+- 📤 **Auto-Upload** — MP4 file sent to Node.js → forwarded to PHP dashboard on completion
+- 💾 **Temp Storage** — Saved to device `cacheDir` during recording, deleted after upload
+- 🖼️ **Dashboard Player** — Inline `<video>` player in media gallery with download option
+
 ### 🎤 Premium Audio Streaming
 
 - 🎧 **Real-time Transmission** — Live audio feed to web browser
 - 🔇 **Silent Background Capture** — Audio recording triggered remotely from dashboard
 - 🎙️ **AAC Encoding** @ 128kbps / 44.1kHz for clear quality
+- ⏱️ **Configurable Duration** — Default 10 seconds, adjustable per command
+- 📤 **Auto-Upload** — M4A file auto-sent to dashboard on completion
+
+### 📱📱 Multiple Device Support
+
+- 📊 **Unlimited Devices** — Monitor and control multiple Android devices simultaneously from one dashboard
+- 🗺️ **Device Grid** — All connected devices shown as individual cards in the dashboard
+- 🟢 **Online Indicator** — Live green border highlight on currently connected devices
+- 🎯 **Per-Device Control** — Each device card has independent buttons: Live View, Photo, Audio, Video
+- 🔄 **Independent Streams** — Live WebRTC view for any device without affecting others
+- 💾 **Device ID Tracking** — Devices identified by unique Android `ANDROID_ID`, persistent across reboots
+- 🕐 **Last Seen Timestamp** — Dashboard shows when each device last connected
+- 🚀 **Auto-Registration** — New devices auto-register in MySQL on first connection — no manual setup needed
+- 📂 **Per-Device Media** — All captures tagged with `device_id` for easy filtering in gallery
+- 🔄 **Independent Reconnect** — Each device reconnects independently without affecting other active sessions
 
 ### 📂 Remote File Explorer
 
@@ -51,7 +88,7 @@
 
 ### ⚙️ Dynamic Signaling Server Configuration
 
-- ✍️ **Change IP/Port at runtime** from the app's Streaming Settings page — stored in SharedPreferences
+- ✍️ **Change IP/Port at runtime** from the app’s Streaming Settings page — stored in SharedPreferences
 - 🧭 **Invisible Settings Button** — Settings button in the top-right corner is intentionally invisible but clickable; tap the top-right area to open Streaming Settings
 - 🌐 **No `network_security_config.xml` required** — App allows cleartext globally (debug/dev friendly)
 
@@ -62,6 +99,7 @@
 - 🎯 **Centralized Control** — All device streams in one comprehensive dashboard
 - 🔐 **Login Protected** — bcrypt-secured admin authentication
 - 🗑️ **Auto-delete Media** — Captured media auto-purged after 24 hours
+- 📱📱 **Multi-Device Gallery** — Media from all devices shown together, tagged by device ID
 
 ---
 
@@ -72,38 +110,35 @@
 │                     SYSTEM ARCHITECTURE                        │
 └────────────────────────────────────────────────────────────────┘
 
-  📱 Android Device                    🖥️ Admin Browser
-  ┌─────────────────┐                 ┌─────────────────┐
-  │ SpywareService  │                 │  PHP Dashboard  │
-  │ (Foreground)    │                 │  index.php      │
-  │                 │                 │  login.php      │
-  │ SocketManager   │◄───Socket.IO───►│  (PHP host)     │
-  │ MediaCapture    │                 │                 │
-  │ Manager         │      ▲          │  Browser JS     │
-  │                 │      │          │  ↕ Socket.IO    │
-  │ WebRTC          │      │          │  ↕ WebRTC       │
-  │ PeerConnection  │      │          └────────┬────────┘
-  └─────────────────┘      │                  │
-         │                 └──────────────────┘
-         │                         ▲
-         ▼                         │
-  ┌──────────────────────────────────────────────────────┐
-  │           Node.js Backend (Render.com)               │
-  │           node-backend/server.js                     │
-  │                                                      │
-  │  • Device registration   • WebRTC SDP relay          │
-  │  • Capture commands      • Media base64 relay        │
-  │  • Auto-reconnect        • Health check /health      │
-  └──────────────────────────────────────────────────────┘
+  📱 Device 1    📱 Device 2   ...N Devices     🖥️ Admin Browser
+  ┌─────────┐  ┌─────────┐               ┌─────────────────┐
+  │SpywareSvc│  │SpywareSvc│               │  PHP Dashboard  │
+  │SocketMgr  │  │SocketMgr  │               │  index.php      │
+  │MediaCapt  │  │MediaCapt  │               │  login.php      │
+  └───┬────┘  └───┬────┘               │  Browser JS     │
+       │              │                   │  ↕ Socket.IO    │
+       │ Socket.IO    │ Socket.IO          │  ↕ WebRTC       │
+       ▼              ▼                   └────────┬────────┘
+  ┌─────────────────────────────────────┬────────┘
+  │     Node.js Backend (Render.com)        │
+  │     node-backend/server.js             │
+  │                                         │
+  │  • rooms{} per device (device_${id})    │
+  │  • deviceSockets{} map (id → socket)   │
+  │  • WebRTC signaling (offer/answer/ICE)  │
+  │  • Capture command relay per device     │
+  │  • Media base64 forwarding             │
+  │  • GET /health for Render keep-alive    │
+  └─────────────────────────────────────────┘
          │
          ▼ (base64 upload via fetch POST)
-  ┌──────────────────────────────────────────────────────┐
-  │           PHP Dashboard + MySQL                      │
-  │  install.php → login.php → index.php                 │
-  │  upload_media.php | delete_media.php                 │
-  │  MySQL: admins, devices, media_captures              │
-  │  Auto-delete media after 24 hours                    │
-  └──────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────┘
+  │     PHP Dashboard + MySQL            │
+  │  install.php → login.php → index.php│
+  │  MySQL: admins, devices,             │
+  │         media_captures               │
+  │  Auto-delete media after 24 hours   │
+  └─────────────────────────────────────────┘
 ```
 
 ---
@@ -116,11 +151,11 @@
 | 📡 `SocketManager.kt` | Socket.IO client wrapper | Auto-reconnect (∞ retry), capture command dispatch, media emit |
 | 🎥 `MediaCaptureManager.kt` | Silent media capture | Camera2 image/video, MediaRecorder audio, background thread |
 | 🚀 `BootReceiver.kt` | Auto-start logic | Restarts service on device boot via `ACTION_BOOT_COMPLETED` |
-| ⚡ `node-backend/server.js` | WebRTC signaling hub | Socket.IO rooms, peer connection facilitation, health endpoint |
+| ⚡ `node-backend/server.js` | WebRTC signaling hub | Socket.IO rooms per device, multi-device support, health endpoint |
 | 🐘 `php-dashboard/install.php` | One-click installer | Creates DB, tables, admin user, writes `config.php` |
 | 🔐 `php-dashboard/login.php` | Admin authentication | bcrypt password verify, PHP sessions |
-| 🎨 `php-dashboard/index.php` | Web dashboard | Live view, media gallery, device controls |
-| ⬆️ `php-dashboard/upload_media.php` | Media storage | Base64→file, DB insert, expiry setting |
+| 🎨 `php-dashboard/index.php` | Web dashboard | Live view, media gallery, multi-device control panel |
+| ⬆️ `php-dashboard/upload_media.php` | Media storage | Base64→file, DB insert, device tagging, expiry setting |
 
 ---
 
@@ -208,6 +243,7 @@ PeerConnection.IceServer.builder("turn:numb.viagenie.ca")
    - 📷 Camera | 🎤 Microphone | 📍 Location
    - 💬 SMS | 📞 Phone | 🔔 Notifications
    - 💾 Manage External Storage (Android 11+ for File Explorer)
+7. Install APK on **each device** you want to monitor — they auto-register on dashboard
 
 ### 4️⃣ Access Dashboard
 
@@ -215,7 +251,7 @@ PeerConnection.IceServer.builder("turn:numb.viagenie.ca")
 https://your-domain.com/login.php
 ```
 
-Login → Device appears in sidebar → All streams available ✅
+Login → All connected devices appear as cards → Control each independently ✅
 
 > 💡 **Pro Tip**: Keep the Android app in the foreground initially to ensure all streams initialize. Once connected, you can minimize the app.
 
@@ -228,10 +264,18 @@ Login → Device appears in sidebar → All streams available ✅
 | WebRTC Live View (Camera) | ✅ |
 | Dual Camera Simultaneous Stream | ✅ API 28+ |
 | Auto-Fallback Single Camera | ✅ |
+| **Silent Image Capture (1280×720 JPEG)** | ✅ NEW |
+| **Front / Back Camera Selection per Capture** | ✅ NEW |
+| **Silent Video Recording (1280×720 MP4 H264)** | ✅ NEW |
+| **Video Duration Control (default 15s)** | ✅ NEW |
+| **Audio+Video Combined Recording** | ✅ NEW |
+| **Auto-Upload on Capture Complete** | ✅ NEW |
 | Real-time Audio Stream | ✅ |
-| Silent Image Capture (front/back) | ✅ |
-| Silent Audio Recording (remote) | ✅ |
-| Silent Video Recording (remote) | ✅ |
+| Silent Audio Recording (M4A, 10s default) | ✅ |
+| **Multiple Device Support (unlimited)** | ✅ NEW |
+| **Per-Device Control Panel** | ✅ NEW |
+| **Device Online/Offline Indicator** | ✅ NEW |
+| **Auto Device Registration (MySQL)** | ✅ NEW |
 | Remote File Explorer | ✅ |
 | Chunked File Download (64KB) | ✅ |
 | Remote File Delete | ✅ |
@@ -266,7 +310,7 @@ WebRTC-Android-prentcontrol/
 │       └── java/com/webrtc/spyware/
 │           ├── SpywareService.kt           ← foreground service (main)
 │           ├── SocketManager.kt            ← Socket.IO + auto-reconnect
-│           ├── MediaCaptureManager.kt      ← Camera2 + MediaRecorder
+│           ├── MediaCaptureManager.kt      ← Camera2 image/video + MediaRecorder audio
 │           └── BootReceiver.kt             ← auto-start on boot
 │
 ├── 🟢 Node.js Backend (Render)
@@ -280,8 +324,8 @@ WebRTC-Android-prentcontrol/
 │       ├── install.php                     ← one-click installer
 │       ├── config.php                      ← auto-generated
 │       ├── login.php                       ← admin login
-│       ├── index.php                       ← dashboard + gallery
-│       ├── upload_media.php                ← media storage
+│       ├── index.php                       ← dashboard + multi-device gallery
+│       ├── upload_media.php                ← media storage (image/audio/video)
 │       ├── delete_media.php                ← media removal
 │       ├── logout.php
 │       ├── .htaccess
@@ -307,14 +351,16 @@ adb logcat | grep SpywareService
 # Monitor SocketManager
 adb logcat | grep SocketManager
 
-# WebRTC specific
-adb logcat | grep MediaCapture
+# Image/Video capture logs
+adb logcat | grep MediaCaptureManager
 ```
 
 **Key Log Indicators:**
 - ✅ `Connected to signaling server`
 - ✅ `Device registered: [ANDROID_ID]`
 - ✅ `Image captured: img_XXXXXXXX.jpg`
+- ✅ `Video recording started`
+- ✅ `Media sent: video_XXXXXXXX.mp4`
 - ❌ `Permission denied: camera`
 - ❌ `Connection error: [reason]`
 
@@ -348,17 +394,20 @@ pc.getStats().then(stats => {
 
 | Problem | Symptoms | Solution |
 |---|---|---|
-| 📷 Camera not streaming | Black screen in dashboard | Check camera permissions, restart app |
-| 🎤 No audio | Silent stream | Verify microphone permissions |
-| 🌐 Device not appearing | No device card in dashboard | Verify `SERVER_URL` in `SpywareService.kt` matches Render URL |
+| 📷 Camera not streaming | Black screen | Check camera permissions, restart app |
+| 📸 Image capture silent fail | No image in gallery | Check `CAMERA` permission + `uploads/` writable |
+| 🎬 Video not uploading | Gallery empty after trigger | Check `cacheDir` write access + INTERNET permission |
+| 🎤 No audio | Silent stream | Verify `RECORD_AUDIO` permission |
+| 📱📱 Devices not showing | Empty device grid | Verify all devices have correct `SERVER_URL` in `SpywareService.kt` |
+| 📱 Device offline (grey border) | Not responding to commands | Device auto-reconnects; check battery optimization whitelist |
 | 📂 File explorer broken | Connection drops | Auto-reconnects; check INTERNET permission |
-| 📍 GPS not updating | No location on map | Grant fine location permission + enable GPS |
+| 📍 GPS not updating | No location on map | Grant `ACCESS_FINE_LOCATION` + enable GPS on device |
 | 🔐 Login fails | "Invalid credentials" | Re-run `install.php` or check `admins` table |
-| 💾 Media not uploading | Gallery empty after capture | Check `uploads/` folder is writable (chmod 755) |
-| 🔋 App killed | Service stops | Whitelist app from battery optimization in device settings |
-| 🌙 Render sleeping | Slow first connection | Free tier sleeps; Android auto-reconnects; use UptimeRobot to keep alive |
-| 🔐 TURN auth failed | ICE connection fails | Update TURN credentials in `SpywareService.kt` |
-| ⚠️ `foregroundServiceType` error | Build fails on API 34+ | Add `FOREGROUND_SERVICE_CAMERA` + `FOREGROUND_SERVICE_MICROPHONE` permissions |
+| 💾 Media not in gallery | Empty after capture | Check `uploads/` folder writable (`chmod 755`) |
+| 🔋 App killed | Service stops | Whitelist from battery optimization settings |
+| 🌙 Render sleeping | Slow first connect | Android auto-reconnects; use UptimeRobot to keep alive |
+| 🔐 TURN auth failed | ICE fails | Update TURN credentials in `SpywareService.kt` |
+| ⚠️ API 34 build fail | `foregroundServiceType` | Add `FOREGROUND_SERVICE_CAMERA` + `MICROPHONE` permissions |
 
 ---
 
@@ -397,6 +446,43 @@ val concurrentSets = cameraManager.concurrentStreamingCameraIds  // API 30+
 
 ---
 
+## 📱📱 Multiple Device Support Details
+
+### How It Works
+
+Each Android device connects to the Node.js server using a unique `ANDROID_ID`. The server maintains a `deviceSockets{}` map and puts every device in its own Socket.IO room (`device_${deviceId}`). The PHP dashboard shows all registered devices as individual cards and lets the admin interact with each one independently.
+
+### Device Lifecycle
+
+```
+Device installs APK
+    ↓
+SpywareService starts → reads ANDROID_ID
+    ↓
+SocketManager connects → emits "register-device" { deviceId }
+    ↓
+Node.js: deviceSockets[deviceId] = socket.id
+         io.emit("device-list-update", allIds)
+    ↓
+PHP Dashboard: device card appears with green border ✅
+    ↓
+Admin can now: Live View | Capture Image | Record Video | Record Audio
+    ↓
+Captures tagged with device_id → stored in MySQL media_captures
+    ↓
+Device disconnects → grey border; auto-reconnects → green border returns
+```
+
+### Scaling
+
+| Devices | Node.js Free Tier | Render Paid |
+|---|---|---|
+| 1–5 | ✅ Works great | ✅ |
+| 5–20 | ✅ Handles well | ✅ |
+| 20+ | ⚠️ Upgrade Render plan | ✅ |
+
+---
+
 ## 🌐 Network Configuration
 
 | Setting | Value |
@@ -405,7 +491,7 @@ val concurrentSets = cameraManager.concurrentStreamingCameraIds  // API 30+
 | STUN Server | `stun:stun.l.google.com:19302` |
 | TURN Server | `turn:numb.viagenie.ca` (optional) |
 | Firewall | Ensure port 3000 accessible |
-| Bandwidth | Minimum 2 Mbps for smooth streaming |
+| Bandwidth | Minimum 2 Mbps per device for smooth streaming |
 
 **TURN Server Alternatives:**
 ```
