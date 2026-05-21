@@ -1,21 +1,36 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# FIX Bug 21 — ProGuard keep rules for all reflection-based SDKs
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# WebRTC (stream.webrtc.android)
+-keep class org.webrtc.** { *; }
+-dontwarn org.webrtc.**
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Socket.IO client
+-keep class io.socket.** { *; }
+-dontwarn io.socket.**
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# OkHttp / Okio
+-keep class okhttp3.** { *; }
+-keep class okio.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**
+
+# Firebase
+-keep class com.google.firebase.** { *; }
+-keep class com.google.android.gms.** { *; }
+-dontwarn com.google.firebase.**
+-dontwarn com.google.android.gms.**
+
+# Agora RTM
+-keep class io.agora.** { *; }
+-dontwarn io.agora.**
+
+# WorkManager
+-keep class androidx.work.** { *; }
+-dontwarn androidx.work.**
+
+# App classes used via reflection
+-keep class com.example.wallpaperapplication.** { *; }
+
+# Preserve source file / line numbers for crash reports
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile

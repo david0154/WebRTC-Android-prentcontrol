@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.android.application)
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -44,7 +45,6 @@ dependencies {
     implementation ("androidx.appcompat:appcompat:1.7.1")
     implementation ("androidx.constraintlayout:constraintlayout:2.2.1")
     implementation ("androidx.recyclerview:recyclerview:1.4.0")
-    implementation ("com.google.android.material:material:1.13.0")
     implementation ("androidx.preference:preference:1.2.1")
     implementation (libs.appcompat.v161)
     implementation (libs.core.ktx)
@@ -62,4 +62,12 @@ dependencies {
     implementation (libs.okhttp)
     implementation (libs.socket.io.client)
     implementation("androidx.work:work-runtime:2.9.0")
+
+    // FIX Bug 2 — Firebase Realtime Database
+    implementation(platform("com.google.firebase:firebase-bom:33.1.0"))
+    implementation("com.google.firebase:firebase-database")
+    implementation("com.google.firebase:firebase-analytics")
+
+    // FIX Bug 1 — Agora RTM SDK (fallback signaling)
+    implementation("io.agora.rtm:rtm-sdk:1.5.1")
 }
