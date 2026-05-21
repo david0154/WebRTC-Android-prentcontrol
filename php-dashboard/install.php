@@ -1,88 +1,98 @@
 <?php
 /**
- * ONE-CLICK INSTALLER
- * Run this file once on your PHP host to set up the full database and config.
- * Delete or rename after install for security.
+ * One-Click Installer
+ * ⚠️ DELETE THIS FILE immediately after successful installation!
  */
-
-$step = $_POST['step'] ?? 'form';
 $error = '';
 $success = '';
 
-if ($step === 'install' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $host   = trim($_POST['db_host']);
-    $dbname = trim($_POST['db_name']);
-    $user   = trim($_POST['db_user']);
-    $pass   = trim($_POST['db_pass']);
-    $admin_user = trim($_POST['admin_user']);
-    $admin_pass = trim($_POST['admin_pass']);
-    $node_url   = rtrim(trim($_POST['node_url']), '/');
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $db_host   = trim($_POST['db_host'] ?? 'localhost');
+    $db_name   = trim($_POST['db_name'] ?? '');
+    $db_user   = trim($_POST['db_user'] ?? '');
+    $db_pass   = $_POST['db_pass'] ?? '';
+    $admin_user = trim($_POST['admin_user'] ?? '');
+    $admin_pass = $_POST['admin_pass'] ?? '';
+    $node_url  = rtrim(trim($_POST['node_url'] ?? ''), '/');
+    $upload_token = bin2hex(random_bytes(24)); // auto-generated secure token
 
-    try {
-        $pdo = new PDO("mysql:host=$host;charset=utf8mb4", $user, $pass, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
-        ]);
+    if (empty($db_name) || empty($db_user) || empty($admin_user) || empty($admin_pass) || empty($node_url)) {
+        $error = 'All fields are required.';
+    } else {
+        try {
+            $pdo = new PDO("mysql:host=$db_host;charset=utf8mb4", $db_user, $db_pass,
+                [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 
-        // Create database
-        $pdo->exec("CREATE DATABASE IF NOT EXISTS `$dbname` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-        $pdo->exec("USE `$dbname`");
+            $pdo->exec("CREATE DATABASE IF NOT EXISTS `" . str_replace('`','', $db_name) . "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            $pdo->exec("USE `" . str_replace('`','', $db_name) . "`");
 
-        // Admin users table
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `admins` (
-                `id` INT AUTO_INCREMENT PRIMARY KEY,
-                `username` VARCHAR(100) NOT NULL UNIQUE,
-                `password` VARCHAR(255) NOT NULL,
-                `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB
-        ");
+            $pdo->exec("CREATE TABLE IF NOT EXISTS admins (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                username   VARCHAR(100) NOT NULL UNIQUE,
+                password   VARCHAR(255) NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB");
 
-        // Devices table
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `devices` (
-                `id` INT AUTO_INCREMENT PRIMARY KEY,
-                `device_id` VARCHAR(100) NOT NULL UNIQUE,
-                `device_name` VARCHAR(200),
-                `last_seen` DATETIME,
-                `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB
-        ");
+            $pdo->exec("CREATE TABLE IF NOT EXISTS devices (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                device_id   VARCHAR(100) NOT NULL UNIQUE,
+                device_name VARCHAR(200),
+                last_seen   DATETIME,
+                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_device_id (device_id)
+            ) ENGINE=InnoDB");
 
-        // Media captures table (temporary storage)
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `media_captures` (
-                `id` INT AUTO_INCREMENT PRIMARY KEY,
-                `device_id` VARCHAR(100) NOT NULL,
-                `media_type` ENUM('image','audio','video') NOT NULL,
-                `filename` VARCHAR(300) NOT NULL,
-                `file_path` VARCHAR(500) NOT NULL,
-                `file_size` INT DEFAULT 0,
-                `captured_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
-                `expires_at` DATETIME DEFAULT NULL,
-                INDEX (`device_id`),
-                INDEX (`media_type`),
-                INDEX (`captured_at`)
-            ) ENGINE=InnoDB
-        ");
+            $pdo->exec("CREATE TABLE IF NOT EXISTS media_captures (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                device_id   VARCHAR(100) NOT NULL,
+                media_type  ENUM('image','audio','video') NOT NULL,
+                filename    VARCHAR(300) NOT NULL,
+                file_path   VARCHAR(500) NOT NULL,
+                file_size   INT DEFAULT 0,
+                captured_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at  DATETIME DEFAULT NULL,
+                INDEX idx_device (device_id),
+                INDEX idx_type   (media_type),
+                INDEX idx_time   (captured_at)
+            ) ENGINE=InnoDB");
 
-        // Insert admin user
-        $hashed = password_hash($admin_pass, PASSWORD_BCRYPT);
-        $stmt = $pdo->prepare("INSERT IGNORE INTO `admins` (username, password) VALUES (?, ?)");
-        $stmt->execute([$admin_user, $hashed]);
+            // Login attempts table for brute-force protection (FIX — missing feature)
+            $pdo->exec("CREATE TABLE IF NOT EXISTS login_attempts (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                ip_address VARCHAR(45) NOT NULL,
+                attempted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_ip (ip_address),
+                INDEX idx_time (attempted_at)
+            ) ENGINE=InnoDB");
 
-        // Write config file
-        $config_content = "<?php\n// Auto-generated by install.php\ndefine('DB_HOST', '$host');\ndefine('DB_NAME', '$dbname');\ndefine('DB_USER', '$user');\ndefine('DB_PASS', '$pass');\ndefine('NODE_BACKEND_URL', '$node_url');\ndefine('MEDIA_UPLOAD_DIR', __DIR__ . '/uploads/');\ndefine('MEDIA_TEMP_EXPIRY_HOURS', 24); // Auto-delete after 24 hours\nsession_start();\n";
-        file_put_contents(__DIR__ . '/config.php', $config_content);
+            $hashed = password_hash($admin_pass, PASSWORD_BCRYPT, ['cost' => 12]);
+            $stmt = $pdo->prepare("INSERT IGNORE INTO admins (username, password) VALUES (?, ?)");
+            $stmt->execute([$admin_user, $hashed]);
 
-        // Create uploads dir
-        if (!is_dir(__DIR__ . '/uploads')) {
-            mkdir(__DIR__ . '/uploads', 0755, true);
-            file_put_contents(__DIR__ . '/uploads/.htaccess', 'Options -Indexes\n');
+            // Write config.php with upload token
+            $config = "<?php\n";
+            $config .= "define('DB_HOST', " . var_export($db_host, true) . ");\n";
+            $config .= "define('DB_NAME', " . var_export($db_name, true) . ");\n";
+            $config .= "define('DB_USER', " . var_export($db_user, true) . ");\n";
+            $config .= "define('DB_PASS', " . var_export($db_pass, true) . ");\n";
+            $config .= "define('NODE_BACKEND_URL', " . var_export($node_url, true) . ");\n";
+            $config .= "define('MEDIA_TEMP_EXPIRY_HOURS', 24);\n";
+            $config .= "define('UPLOAD_TOKEN', " . var_export($upload_token, true) . ");\n";
+            $config .= "define('SESSION_TIMEOUT', 3600);\n";
+
+            file_put_contents(__DIR__ . '/config.php', $config);
+
+            // Create uploads directory
+            $uploads = __DIR__ . '/uploads';
+            if (!is_dir($uploads)) mkdir($uploads, 0755, true);
+            file_put_contents($uploads . '/.htaccess', "Options -Indexes\nphp_flag engine off\n");
+
+            $success = "Installation successful! Your upload token (save this): <code>$upload_token</code><br><br>"
+                     . "<strong style='color:red'>⚠️ DELETE this install.php file NOW via FTP!</strong><br><br>"
+                     . '<a href="login.php">→ Go to Dashboard Login</a>';
+        } catch (PDOException $e) {
+            $error = 'Database error: ' . htmlspecialchars($e->getMessage());
         }
-
-        $success = 'Installation complete! <a href="index.php">Go to Dashboard</a>. Delete install.php for security.';
-    } catch (Exception $e) {
-        $error = 'Error: ' . $e->getMessage();
     }
 }
 ?>
@@ -90,32 +100,31 @@ if ($step === 'install' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Install - ParentControl Dashboard</title>
+<title>Install — WebRTC ParentControl</title>
 <style>
-body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
-.box{background:#16213e;padding:2rem;border-radius:12px;width:400px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
-h2{color:#e94560;margin-top:0}input{width:100%;padding:10px;margin:6px 0 14px;background:#0f3460;border:1px solid #444;border-radius:6px;color:#fff;box-sizing:border-box}
-btn, button{width:100%;padding:12px;background:#e94560;border:none;border-radius:6px;color:#fff;font-size:16px;cursor:pointer}
-.err{color:#ff6b6b;margin-bottom:10px}.suc{color:#6bff9e;margin-bottom:10px}
+  body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #1a1a2e; color: #eee; }
+  h1 { color: #e94560; }
+  input { width: 100%; padding: 10px; margin: 6px 0 14px; box-sizing: border-box; border-radius: 6px; border: 1px solid #444; background: #16213e; color: #eee; }
+  button { background: #e94560; color: #fff; border: none; padding: 12px 30px; border-radius: 6px; cursor: pointer; font-size: 15px; }
+  .error { background: #c0392b; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
+  .success { background: #27ae60; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
+  label { font-size: 13px; color: #aaa; }
 </style>
 </head>
 <body>
-<div class="box">
-  <h2>⚙️ One-Click Installer</h2>
-  <?php if ($error): ?><div class="err"><?= htmlspecialchars($error) ?></div><?php endif; ?>
-  <?php if ($success): ?><div class="suc"><?= $success ?></div><?php else: ?>
-  <form method="POST">
-    <input type="hidden" name="step" value="install">
-    <label>DB Host</label><input name="db_host" value="localhost" required>
-    <label>DB Name</label><input name="db_name" value="parentcontrol" required>
-    <label>DB User</label><input name="db_user" required>
-    <label>DB Password</label><input type="password" name="db_pass">
-    <label>Admin Username</label><input name="admin_user" value="admin" required>
-    <label>Admin Password</label><input type="password" name="admin_pass" required>
-    <label>Node.js Backend URL (Render)</label><input name="node_url" placeholder="https://your-app.onrender.com" required>
-    <button type="submit">Install Now</button>
-  </form>
-  <?php endif; ?>
-</div>
+<h1>🛠️ WebRTC ParentControl — Installer</h1>
+<?php if ($error): ?><div class="error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
+<?php if ($success): ?><div class="success"><?= $success ?></div><?php else: ?>
+<form method="POST">
+  <label>DB Host</label><input name="db_host" value="localhost" required>
+  <label>DB Name</label><input name="db_name" placeholder="parentcontrol" required>
+  <label>DB User</label><input name="db_user" required>
+  <label>DB Password</label><input name="db_pass" type="password">
+  <label>Admin Username</label><input name="admin_user" required>
+  <label>Admin Password</label><input name="admin_pass" type="password" required>
+  <label>Node.js Backend URL (Render)</label><input name="node_url" placeholder="https://your-app.onrender.com" required>
+  <button type="submit">Install Now</button>
+</form>
+<?php endif; ?>
 </body>
 </html>

